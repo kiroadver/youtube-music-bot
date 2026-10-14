@@ -160,7 +160,7 @@ def search_youtube(query: str, limit: int = MAX_RESULTS) -> list[dict]:
     return results
 
 
-def download_audio(video_url: str) -> tuple[str, dict]:
+def download_audio(video_url: str, progress_hooks: list | None = None) -> tuple[str, dict]:
     """Download audio as MP3 (requires ffmpeg), return (filepath, info)."""
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
     opts = {
@@ -175,11 +175,14 @@ def download_audio(video_url: str) -> tuple[str, dict]:
                 "preferredcodec": "mp3",
                 "preferredquality": "192",
             },
-            {"key": "FFmpegMetadata"},
         ],
         "max_filesize": MAX_FILESIZE,
         "socket_timeout": 20,
+        "retries": 1,
+        "fragment_retries": 1,
     }
+    if progress_hooks:
+        opts["progress_hooks"] = progress_hooks
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(video_url, download=True)
         filepath = ydl.prepare_filename(info)
@@ -188,6 +191,49 @@ def download_audio(video_url: str) -> tuple[str, dict]:
             if os.path.exists(mp3):
                 filepath = mp3
     return filepath, info
+
+
+async def download_with_progress(url: str, status, title: str) -> tuple[str, dict]:
+    """Download in background thread while editing status with live % progress."""
+    state = {"pct": 0, "phase": "download"}
+
+    def hook(d):
+        try:
+            if d.get("status") == "downloading":
+                total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
+                done = d.get("downloaded_bytes") or 0
+                if total:
+                    state["pct"] = int(done * 100 / total)
+            elif d.get("status") == "finished":
+                state["phase"] = "convert"
+        except Exception:
+            pass
+
+    loop = asyncio.get_event_loop()
+    task = loop.run_in_executor(None, lambda: download_audio(url, [hook]))
+    last_text = ""
+    start = loop.time()
+    while not task.done():
+        if loop.time() - start > DOWNLOAD_TIMEOUT:
+            raise asyncio.TimeoutError
+        await asyncio.sleep(4)
+        if state["phase"] == "convert":
+            text = f"⏳ Konversi MP3: <b>{html.escape(truncate(title, 50))}</b>…"
+        elif state["pct"] > 0:
+            bar = "█" * (state["pct"] // 10) + "░" * (10 - state["pct"] // 10)
+            text = (
+                f"⏳ Download {state['pct']}% {bar}\n"
+                f"<b>{html.escape(truncate(title, 50))}</b>"
+            )
+        else:
+            text = f"⏳ Menghubungi YouTube…\n<b>{html.escape(truncate(title, 50))}</b>"
+        if text != last_text:
+            last_text = text
+            try:
+                await status.edit_text(text, parse_mode=ParseMode.HTML)
+            except Exception:
+                pass
+    return task.result()
 
 
 def format_duration(seconds) -> str:
@@ -370,9 +416,7 @@ async def handle_direct(update: Update, context: ContextTypes.DEFAULT_TYPE, text
     status = await update.message.reply_text("⏳ Mengambil lagu…")
     await update.effective_chat.send_action(ChatAction.UPLOAD_VOICE)
     try:
-        filepath, info = await asyncio.wait_for(
-            asyncio.to_thread(download_audio, url), timeout=DOWNLOAD_TIMEOUT
-        )
+        filepath, info = await download_with_progress(url, status, url)
     except asyncio.TimeoutError:
         await status.edit_text("❌ Timeout download. Coba lagi.")
         return
@@ -472,8 +516,8 @@ async def send_song(update: Update, context: ContextTypes.DEFAULT_TYPE,
     )
     await update.effective_chat.send_action(ChatAction.UPLOAD_VOICE)
     try:
-        filepath, _info = await asyncio.wait_for(
-            asyncio.to_thread(download_audio, res["url"]), timeout=DOWNLOAD_TIMEOUT
+        filepath, _info = await download_with_progress(
+            res["url"], status, res["title"]
         )
     except asyncio.TimeoutError:
         await status.edit_text("❌ Timeout download. Coba lagi atau pilih hasil lain.")
