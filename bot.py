@@ -36,6 +36,14 @@ def _cookie_opts() -> dict:
     return {}
 
 
+def _js_runtime_opts() -> dict:
+    """Add deno JS runtime if available (needed to bypass YouTube PO token challenge)."""
+    import shutil
+    if shutil.which("deno"):
+        return {"js_runtimes": {"deno": {"path": "deno"}}}
+    return {}
+
+
 YDL_OPTS_BASE = {
     "quiet": True,
     "no_warnings": True,
@@ -69,6 +77,7 @@ def search_youtube(query: str, limit: int = MAX_RESULTS) -> list[dict]:
     search_opts = {
         **YDL_OPTS_BASE,
         **_cookie_opts(),
+        **_js_runtime_opts(),
         "extract_flat": True,
         "skip_download": True,
     }
@@ -106,6 +115,7 @@ def download_audio(video_url: str) -> tuple[str, dict]:
     opts = {
         **YDL_OPTS_BASE,
         **_cookie_opts(),
+        **_js_runtime_opts(),
         "format": "bestaudio/best",
         "outtmpl": os.path.join(DOWNLOAD_DIR, "%(id)s.%(ext)s"),
         "postprocessors": [

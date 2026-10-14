@@ -70,6 +70,7 @@ https://youtu.be/XXXXXXX
 - Python 3.10+
 - Token bot dari [@BotFather](https://t.me/BotFather)
 - `ffmpeg` terinstall (wajib) — buat konversi audio jadi MP3
+- `deno` (opsional, disarankan) — yt-dlp butuh JS runtime buat bypass challenge YouTube
 
 ### Langkah-langkah
 
@@ -86,13 +87,19 @@ https://youtu.be/XXXXXXX
    sudo apt install ffmpeg   # Debian/Ubuntu
    ```
 
-3. **Install dependensi Python**
+3. **Install deno** (opsional, tapi bikin download lebih stabil)
+
+   ```bash
+   curl -fsSL https://deno.land/install.sh | sh
+   ```
+
+4. **Install dependensi Python**
 
    ```bash
    pip install -r requirements.txt
    ```
 
-4. **Set token bot**
+5. **Set token bot**
 
    Dari terminal:
 
@@ -102,7 +109,7 @@ https://youtu.be/XXXXXXX
 
    atau bikin file `.env` (sudah di-gitignore) kalau pakai wrapper yang support.
 
-5. **Jalankan**
+6. **Jalankan**
 
    ```bash
    python bot.py
@@ -110,7 +117,7 @@ https://youtu.be/XXXXXXX
 
    Kalau ffmpeg belum ada, bot bakal nolak start dan kasih petunjuk install-nya.
 
-5. **Tes di Telegram**
+7. **Tes di Telegram**
 
    Buka bot-mu, ketik `/start` → `/play tulus monokrom`.
 
@@ -169,14 +176,11 @@ sudo systemctl status yt-music-bot
 1. Di browser (Chrome/Firefox), install extension **"Get cookies.txt LOCALLY"**
 2. Buka youtube.com, login ke akun Google
 3. Export cookies, simpan filenya (misal `cookies.txt`)
-4. Di Railway: **Variables → tambah `YTDLP_COOKIES`** → isi path file cookies
-   (upload file cookies via **Volumes** atau tempel isinya ke env var `YTDLP_COOKIES` sebagai path di container)
+   - Format Netscape (7 kolom tab-separated): `.youtube.com	TRUE	/	TRUE	<expires>	<name>	<value>`
+4. Set env var: `YTDLP_COOKIES=/path/ke/cookies.txt`
+   - Di Railway: upload via **Volumes**, lalu set path-nya di **Variables**
 
-Cara paling gampang di Railway:
-- Upload `cookies.txt` ke repo (tambahin di `.gitignore` kebalik / pake Railway **Volumes**)
-- Set env var `YTDLP_COOKIES=/data/cookies.txt`
-
-> ⚠️ Jangan commit cookies ke GitHub (sudah di `.gitignore`).
+> ⚠️ Jangan commit `cookies.txt` ke GitHub (sudah di `.gitignore`).
 
 ## ⚖️ Disclaimer
 
