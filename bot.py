@@ -439,6 +439,91 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(HELP_TEXT, parse_mode=ParseMode.HTML)
 
 
+def _is_admin(update: Update) -> bool:
+    if not ADMIN_CHAT_ID:
+        return True
+    try:
+        return str(update.effective_chat.id) == str(ADMIN_CHAT_ID)
+    except Exception:
+        return False
+
+
+async def cmd_health(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin-only: report ffmpeg/deno/cookies/yt-dlp status + quick player probe."""
+    if not _is_admin(update):
+        await update.message.reply_text("❌ Khusus admin.")
+        return
+    import subprocess
+
+    lines = ["🩺 <b>Health check</b>\n"]
+
+    # ffmpeg
+    ff = shutil.which("ffmpeg")
+    if ff:
+        try:
+            v = subprocess.run([ff, "-version"], capture_output=True, text=True, timeout=10)
+            lines.append(f"✅ ffmpeg: {(v.stdout.splitlines() or ['?'])[0][:60]}")
+        except Exception as e:
+            lines.append(f"⚠️ ffmpeg ada tapi error: {html.escape(str(e)[:80])}")
+    else:
+        lines.append("❌ ffmpeg: gak ketemu")
+
+    # deno
+    dn = shutil.which("deno")
+    lines.append(f"{'✅' if dn else '❌'} deno: {html.escape(dn or 'gak ketemu')}")
+
+    # yt-dlp
+    try:
+        lines.append(f"✅ yt-dlp: {html.escape(yt_dlp.version.__version__)}")
+    except Exception:
+        lines.append("❌ yt-dlp: unknown")
+
+    # cookies
+    co = _cookie_opts()
+    if co.get("cookiefile"):
+        p = co["cookiefile"]
+        try:
+            n = sum(1 for line in open(p) if line.strip() and not line.startswith("#"))
+            src = "env YTDLP_COOKIES_CONTENT" if p == "/tmp/ytmusic-cookies.txt" else f"file {p}"
+            lines.append(f"✅ cookies: {n} entries ({html.escape(src)})")
+        except Exception as e:
+            lines.append(f"⚠️ cookies: path ada tapi gak kebaca ({html.escape(str(e)[:80])})")
+    else:
+        lines.append("❌ cookies: BELUM DI-SET (YTDLP_COOKIES / YTDLP_COOKIES_CONTENT)")
+
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+    # quick player probe (30s max)
+    probe = await update.message.reply_text("⏳ Tes player YouTube…")
+    def _probe():
+        opts = {
+            **YDL_OPTS_BASE,
+            **_cookie_opts(),
+            **_js_runtime_opts(),
+            "extractor_args": {"youtube": {"player_client": ["android", "tv", "web"]}},
+            "socket_timeout": 10,
+        }
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(
+                "https://www.youtube.com/watch?v=jNQXAC9IVRw", download=False
+            )
+            fmts = info.get("formats") or []
+            return info.get("title"), len(fmts)
+    try:
+        title, nfmt = await asyncio.wait_for(asyncio.to_thread(_probe), timeout=40)
+        await probe.edit_text(
+            f"✅ Player OK: {html.escape(str(title)[:60])} ({nfmt} format)",
+            parse_mode=ParseMode.HTML,
+        )
+    except asyncio.TimeoutError:
+        await probe.edit_text("❌ Player probe timeout (40s). IP kemungkinan diblokir.")
+    except Exception as e:
+        await probe.edit_text(
+            f"❌ Player gagal: <code>{html.escape(short_error(e, 300))}</code>",
+            parse_mode=ParseMode.HTML,
+        )
+
+
 async def cmd_play(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await handle_search(update, context, " ".join(context.args or []))
 
@@ -682,6 +767,7 @@ def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler(["start", "help"], cmd_start))
+    app.add_handler(CommandHandler("health", cmd_health))
     app.add_handler(CommandHandler("play", cmd_play))
     app.add_handler(CommandHandler("dl", cmd_dl))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
