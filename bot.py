@@ -112,6 +112,26 @@ def _cookie_opts() -> dict:
     return {}
 
 
+def _player_configs() -> list[dict]:
+    """Ordered player-client configs to try (first success wins).
+
+    - android: no login/PO-token needed, often bypasses bot-check
+    - tv + cookies: logged-in TV client
+    - web + cookies + deno: full web client with JS challenge solver
+    """
+    cookie = _cookie_opts()
+    js = _js_runtime_opts()
+    return [
+        {"extractor_args": {"youtube": {"player_client": ["android"]}}},
+        {**cookie, "extractor_args": {"youtube": {"player_client": ["tv"]}}},
+        {
+            **cookie,
+            **js,
+            "extractor_args": {"youtube": {"player_client": ["web"]}},
+        },
+    ]
+
+
 def _js_runtime_opts() -> dict:
     if shutil.which("deno"):
         return {"js_runtimes": {"deno": {"path": "deno"}}}
@@ -176,27 +196,44 @@ def search_youtube(query: str, limit: int = MAX_RESULTS) -> list[dict]:
 
 def download_audio(video_url: str, progress_hooks: list | None = None,
                    pp_hooks: list | None = None) -> tuple[str, dict]:
-    """Download best audio only (no conversion here), return (filepath, info)."""
+    """Download best audio only (no conversion here), return (filepath, info).
+
+    Tries multiple player clients in order; first success wins.
+    """
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-    opts = {
-        **YDL_OPTS_BASE,
-        **_cookie_opts(),
-        **_js_runtime_opts(),
-        "format": "bestaudio/best",
-        "outtmpl": os.path.join(DOWNLOAD_DIR, "%(id)s.%(ext)s"),
-        "max_filesize": MAX_FILESIZE,
-        "socket_timeout": 20,
-        "retries": 1,
-        "fragment_retries": 1,
-    }
-    if progress_hooks:
-        opts["progress_hooks"] = progress_hooks
-    if pp_hooks:
-        opts["postprocessor_hooks"] = pp_hooks
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(video_url, download=True)
-        filepath = ydl.prepare_filename(info)
-    return filepath, info
+    last_err: Exception | None = None
+    for cfg in _player_configs():
+        opts = {
+            **YDL_OPTS_BASE,
+            **cfg,
+            "format": "bestaudio/best",
+            "outtmpl": os.path.join(DOWNLOAD_DIR, "%(id)s.%(ext)s"),
+            "max_filesize": MAX_FILESIZE,
+            "socket_timeout": 20,
+            "retries": 1,
+            "fragment_retries": 1,
+        }
+        if progress_hooks:
+            opts["progress_hooks"] = progress_hooks
+        if pp_hooks:
+            opts["postprocessor_hooks"] = pp_hooks
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(video_url, download=True)
+                filepath = ydl.prepare_filename(info)
+            logging.info(
+                "download ok via %s",
+                cfg.get("extractor_args", {}).get("youtube", {}).get("player_client"),
+            )
+            return filepath, info
+        except Exception as e:
+            last_err = e
+            logging.warning(
+                "player %s failed: %s",
+                cfg.get("extractor_args", {}).get("youtube", {}).get("player_client"),
+                str(e)[:150],
+            )
+    raise last_err if last_err else RuntimeError("download gagal semua client")
 
 
 def convert_to_mp3(src: str, timeout_s: int = 90) -> str:
