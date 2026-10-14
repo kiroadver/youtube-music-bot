@@ -337,9 +337,9 @@ async def clear_previous_media(update: Update, context: ContextTypes.DEFAULT_TYP
     media_ids = context.user_data.get("media_ids", [])
     for msg_id in media_ids:
         try:
-            await update.bot.delete_message(update.effective_chat.id, msg_id)
-        except Exception:
-            pass
+            await context.bot.delete_message(update.effective_chat.id, msg_id)
+        except Exception as e:
+            logging.warning("delete %s failed: %s", msg_id, e)
     context.user_data["media_ids"] = []
 
 
