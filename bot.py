@@ -42,11 +42,24 @@ YDL_OPTS_BASE = {
     "no_warnings": True,
     "noplaylist": True,
     "nocheckcertificate": True,
-    "retries": 2,
-    # Try android/tv clients first — they bypass the web PO-token challenge
-    # that causes "Sign in to confirm you're not a bot" on server IPs.
-    "extractor_args": {"youtube": {"player_client": ["web_embedded", "android", "tv", "web"], "player_skip": ["webpage", "configs"]}},
+    "retries": 0,
 }
+
+# Player clients tried one-by-one (first success wins). Embedded/music
+# clients face lighter bot-checks than the main web client.
+PLAYER_CLIENTS = ["web_embedded", "android_music", "android", "tv", "web"]
+DOWNLOAD_FORMATS = ("bestaudio[ext=m4a]/bestaudio/best", "best")
+
+
+def _client_opts(client: str) -> dict:
+    return {
+        "extractor_args": {
+            "youtube": {
+                "player_client": [client],
+                "player_skip": ["webpage", "configs"],
+            }
+        }
+    }
 
 
 def is_bot_blocked_error(e: Exception) -> bool:
@@ -175,28 +188,45 @@ def search_youtube(query: str, limit: int = MAX_RESULTS) -> list[dict]:
 
 
 def download_audio(video_url: str, progress_hooks: list | None = None,
-                   pp_hooks: list | None = None) -> tuple[str, dict]:
-    """Download best audio only (no conversion here), return (filepath, info)."""
+                   pp_hooks: list | None = None,
+                   on_client: object = None) -> tuple[str, dict]:
+    """Download best audio (no conversion here). Tries each player client
+    one-by-one, each with audio-first then muxed format. First success wins."""
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-    opts = {
-        **YDL_OPTS_BASE,
-        **_cookie_opts(),
-        **_js_runtime_opts(),
-        "format": "bestaudio/best",
-        "outtmpl": os.path.join(DOWNLOAD_DIR, "%(id)s.%(ext)s"),
-        "max_filesize": MAX_FILESIZE,
-        "socket_timeout": 20,
-        "retries": 1,
-        "fragment_retries": 1,
-    }
-    if progress_hooks:
-        opts["progress_hooks"] = progress_hooks
-    if pp_hooks:
-        opts["postprocessor_hooks"] = pp_hooks
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(video_url, download=True)
-        filepath = ydl.prepare_filename(info)
-    return filepath, info
+    errs: list[str] = []
+    for client in PLAYER_CLIENTS:
+        for fmt in DOWNLOAD_FORMATS:
+            opts = {
+                **YDL_OPTS_BASE,
+                **_cookie_opts(),
+                **_js_runtime_opts(),
+                **_client_opts(client),
+                "format": fmt,
+                "outtmpl": os.path.join(DOWNLOAD_DIR, "%(id)s.%(ext)s"),
+                "max_filesize": MAX_FILESIZE,
+                "socket_timeout": 15,
+                "fragment_retries": 0,
+            }
+            if progress_hooks:
+                opts["progress_hooks"] = progress_hooks
+            if pp_hooks:
+                opts["postprocessor_hooks"] = pp_hooks
+            try:
+                if on_client:
+                    try:
+                        on_client(client, fmt)
+                    except Exception:
+                        pass
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    info = ydl.extract_info(video_url, download=True)
+                    filepath = ydl.prepare_filename(info)
+                logging.info("download ok via %s (%s)", client, fmt)
+                return filepath, info
+            except Exception as e:
+                msg = str(e).strip().split("\n")[0][:120]
+                errs.append(f"{client}/{fmt.split('/')[0]}: {msg}")
+                logging.warning("download %s %s failed: %s", client, fmt, msg)
+    raise RuntimeError("semua client gagal: " + " | ".join(errs))
 
 
 def convert_to_mp3(src: str, timeout_s: int = 90) -> str:
@@ -268,7 +298,10 @@ async def download_with_progress(url: str, status, title: str) -> tuple[str, dic
                 f"<b>{html.escape(truncate(title, 50))}</b>"
             )
         else:
-            text = f"⏳ Menghubungi YouTube…\n<b>{html.escape(truncate(title, 50))}</b>"
+            text = (
+                f"⏳ Menghubungi YouTube… [{html.escape(str(state.get('client', '…')))}]\n"
+                f"<b>{html.escape(truncate(title, 50))}</b>"
+            )
         if text != last_text:
             last_text = text
             try:
@@ -276,10 +309,17 @@ async def download_with_progress(url: str, status, title: str) -> tuple[str, dic
             except Exception:
                 pass
 
-    # Phase 1: download (max 120s)
-    dl_task = loop.run_in_executor(None, lambda: download_audio(url, [hook], [pp_hook]))
+    # Phase 1: download (max 240s — tries 5 clients x 2 formats)
+    state["client"] = "…"
+    dl_task = loop.run_in_executor(
+        None,
+        lambda: download_audio(
+            url, [hook], [pp_hook],
+            on_client=lambda c, f: state.update(client=c),
+        ),
+    )
     while not dl_task.done():
-        if loop.time() - start > 120:
+        if loop.time() - start > 240:
             raise asyncio.TimeoutError("download")
         await asyncio.sleep(4)
         await pump_status()
@@ -498,14 +538,14 @@ async def cmd_health(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
-    # quick player probe (30s max)
-    probe = await update.message.reply_text("⏳ Tes player YouTube…")
-    def _probe():
+    # quick player probe per client (stops at first success)
+    probe = await update.message.reply_text("⏳ Tes player YouTube per client…")
+    def _probe_one(client: str):
         opts = {
             **YDL_OPTS_BASE,
             **_cookie_opts(),
             **_js_runtime_opts(),
-            "extractor_args": {"youtube": {"player_client": ["web_embedded", "android", "tv", "web"], "player_skip": ["webpage", "configs"]}},
+            **_client_opts(client),
             "socket_timeout": 10,
         }
         with yt_dlp.YoutubeDL(opts) as ydl:
@@ -514,19 +554,20 @@ async def cmd_health(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             fmts = info.get("formats") or []
             return info.get("title"), len(fmts)
-    try:
-        title, nfmt = await asyncio.wait_for(asyncio.to_thread(_probe), timeout=40)
-        await probe.edit_text(
-            f"✅ Player OK: {html.escape(str(title)[:60])} ({nfmt} format)",
-            parse_mode=ParseMode.HTML,
-        )
-    except asyncio.TimeoutError:
-        await probe.edit_text("❌ Player probe timeout (40s). IP kemungkinan diblokir.")
-    except Exception as e:
-        await probe.edit_text(
-            f"❌ Player gagal: <code>{html.escape(short_error(e, 300))}</code>",
-            parse_mode=ParseMode.HTML,
-        )
+    verdicts = []
+    for client in PLAYER_CLIENTS:
+        try:
+            _t, _n = await asyncio.wait_for(
+                asyncio.to_thread(_probe_one, client), timeout=15
+            )
+            verdicts.append(f"✅ {client}: {_n} format")
+            break
+        except Exception as e:
+            verdicts.append(f"❌ {client}: {html.escape(short_error(e, 90))}")
+    await probe.edit_text(
+        "🔬 <b>Hasil probe per client:</b>\n" + "\n".join(verdicts),
+        parse_mode=ParseMode.HTML,
+    )
 
 
 async def cmd_play(update: Update, context: ContextTypes.DEFAULT_TYPE):
