@@ -45,7 +45,7 @@ YDL_OPTS_BASE = {
     "retries": 2,
     # Try android/tv clients first — they bypass the web PO-token challenge
     # that causes "Sign in to confirm you're not a bot" on server IPs.
-    "extractor_args": {"youtube": {"player_client": ["android", "tv", "web"]}},
+    "extractor_args": {"youtube": {"player_client": ["web_embedded", "android", "tv", "web"]}},
 }
 
 
@@ -478,12 +478,17 @@ async def cmd_health(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         lines.append("❌ yt-dlp: unknown")
 
-    # cookies
+    # cookies (count #HttpOnly_ lines too — yt-dlp loads those)
     co = _cookie_opts()
     if co.get("cookiefile"):
         p = co["cookiefile"]
         try:
-            n = sum(1 for line in open(p) if line.strip() and not line.startswith("#"))
+            n = sum(
+                1 for line in open(p)
+                if line.strip() and not (
+                    line.startswith("#") and not line.startswith("#HttpOnly_")
+                )
+            )
             src = "env YTDLP_COOKIES_CONTENT" if p == "/tmp/ytmusic-cookies.txt" else f"file {p}"
             lines.append(f"✅ cookies: {n} entries ({html.escape(src)})")
         except Exception as e:
@@ -500,7 +505,7 @@ async def cmd_health(update: Update, context: ContextTypes.DEFAULT_TYPE):
             **YDL_OPTS_BASE,
             **_cookie_opts(),
             **_js_runtime_opts(),
-            "extractor_args": {"youtube": {"player_client": ["android", "tv", "web"]}},
+            "extractor_args": {"youtube": {"player_client": ["web_embedded", "android", "tv", "web"]}},
             "socket_timeout": 10,
         }
         with yt_dlp.YoutubeDL(opts) as ydl:
