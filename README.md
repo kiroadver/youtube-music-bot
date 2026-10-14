@@ -69,7 +69,7 @@ https://youtu.be/XXXXXXX
 
 - Python 3.10+
 - Token bot dari [@BotFather](https://t.me/BotFather)
-- (Opsional tapi disarankan) `ffmpeg` terinstall — buat konversi audio jadi MP3
+- `ffmpeg` terinstall (wajib) — buat konversi audio jadi MP3
 
 ### Langkah-langkah
 
@@ -80,20 +80,19 @@ https://youtu.be/XXXXXXX
    cd youtube-music-bot
    ```
 
-2. **Install dependensi**
+2. **Install ffmpeg** (kalau belum ada)
 
    ```bash
-   pip install -r requirements.txt
-   ```
-
-   Kalau di VPS/Server (Linux):
-
-   ```bash
-   pip install -r requirements.txt
    sudo apt install ffmpeg   # Debian/Ubuntu
    ```
 
-3. **Set token bot**
+3. **Install dependensi Python**
+
+   ```bash
+   pip install -r requirements.txt
+   ```
+
+4. **Set token bot**
 
    Dari terminal:
 
@@ -103,11 +102,13 @@ https://youtu.be/XXXXXXX
 
    atau bikin file `.env` (sudah di-gitignore) kalau pakai wrapper yang support.
 
-4. **Jalankan**
+5. **Jalankan**
 
    ```bash
    python bot.py
    ```
+
+   Kalau ffmpeg belum ada, bot bakal nolak start dan kasih petunjuk install-nya.
 
 5. **Tes di Telegram**
 

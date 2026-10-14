@@ -89,17 +89,30 @@ def search_youtube(query: str, limit: int = MAX_RESULTS) -> list[dict]:
 
 
 def download_audio(video_url: str) -> tuple[str, dict]:
-    """Download audio, return (filepath, info)."""
+    """Download audio as MP3 (requires ffmpeg), return (filepath, info)."""
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
     opts = {
         **YDL_OPTS_BASE,
-        "format": "bestaudio[ext=m4a]/bestaudio/best",
+        "format": "bestaudio/best",
         "outtmpl": os.path.join(DOWNLOAD_DIR, "%(id)s.%(ext)s"),
+        "postprocessors": [
+            {
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": "mp3",
+                "preferredquality": "192",
+            },
+            {"key": "FFmpegMetadata"},
+        ],
         "max_filesize": MAX_FILESIZE,
     }
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(video_url, download=True)
         filepath = ydl.prepare_filename(info)
+        # Postprocessor renames output to .mp3
+        if not filepath.endswith(".mp3"):
+            mp3 = os.path.splitext(filepath)[0] + ".mp3"
+            if os.path.exists(mp3):
+                filepath = mp3
     return filepath, info
 
 
@@ -371,6 +384,13 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     if not BOT_TOKEN:
         raise SystemExit("Set BOT_TOKEN env var. Get token dari @BotFather.")
+
+    import shutil
+    if shutil.which("ffmpeg") is None:
+        raise SystemExit(
+            "ffmpeg gak ketemu. Install dulu: sudo apt install ffmpeg (Debian/Ubuntu)"
+        )
+
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler(["start", "help"], cmd_start))
