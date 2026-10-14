@@ -10,7 +10,6 @@ import logging
 import requests
 import yt_dlp
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram import InputMediaPhoto, InputMediaAudio
 from telegram.constants import ChatAction, ParseMode
 from telegram.ext import (
     ApplicationBuilder,
@@ -354,59 +353,54 @@ async def send_media_group(
     filesize_mb: float,
     audio_file_id: str | None = None,
 ) -> None:
-    """Send thumbnail + audio as a single media group (inline, not stacked)."""
-    media: list = []
-
+    """Send cover photo + audio. Telegram forbids inline buttons on media
+    groups, so the photo and audio go as two messages with the keyboard
+    on the audio. Both IDs are tracked for auto-cleanup."""
     thumb = await asyncio.to_thread(fetch_thumbnail, res)
-    if thumb:
-        media.append(
-            InputMediaPhoto(
+
+    async def _send():
+        sent_ids: list[int] = []
+        if thumb:
+            photo_msg = await update.effective_message.reply_photo(
                 io.BytesIO(thumb),
                 caption=(
                     f"🖼️ {html.escape(truncate(res['title'], 70))}"
                     f" — {html.escape(truncate(res['uploader'], 40))}"
                 ),
+                parse_mode=ParseMode.HTML,
             )
-        )
-
-    if audio_file_id:
-        media.append(
-            InputMediaAudio(
+            sent_ids.append(photo_msg.message_id)
+        if audio_file_id:
+            audio_msg = await update.effective_message.reply_audio(
                 audio_file_id,
                 caption=build_song_card(res, filesize_mb),
+                parse_mode=ParseMode.HTML,
+                reply_markup=build_results_keyboard(results, index),
             )
-        )
-    else:
-        media.append(
-            InputMediaAudio(
+        else:
+            audio_msg = await update.effective_message.reply_audio(
                 audio_file,
+                title=truncate(res["title"], 60),
+                performer=truncate(res["uploader"], 60),
+                duration=int(res["duration"] or 0),
+                thumbnail=thumb,
                 caption=build_song_card(res, filesize_mb),
+                parse_mode=ParseMode.HTML,
+                reply_markup=build_results_keyboard(results, index),
             )
-        )
+        sent_ids.append(audio_msg.message_id)
+        return audio_msg, sent_ids
 
-    last = media[-1]
-    last.reply_markup = build_results_keyboard(results, index)
-    last.parse_mode = ParseMode.HTML
-    for m in media:
-        if m is not last:
-            m.parse_mode = ParseMode.HTML
+    audio_msg, sent_ids = await asyncio.wait_for(_send(), timeout=180)
+    context.user_data.setdefault("media_ids", []).extend(sent_ids)
 
-    msg = await asyncio.wait_for(
-        update.effective_message.reply_media_group(media), timeout=180
-    )
-    ids = [m.message_id for m in msg]
-    context.user_data.setdefault("media_ids", []).extend(ids)
-    context.user_data.setdefault("last_group", []).extend(ids)
-
-    # Cache file_id of the uploaded audio (last item in group) for instant resend
+    # Cache file_id of the uploaded audio for instant resend
     if audio_file_id:
         context.user_data.setdefault("file_ids", {})[res["id"]] = audio_file_id
     else:
         context.user_data.setdefault("sizes", {})[res["id"]] = filesize_mb
-        for m in msg:
-            if m.audio and m.audio.file_id:
-                context.user_data.setdefault("file_ids", {})[res["id"]] = m.audio.file_id
-                break
+        if audio_msg.audio and audio_msg.audio.file_id:
+            context.user_data.setdefault("file_ids", {})[res["id"]] = audio_msg.audio.file_id
 
 
 HELP_TEXT = (
