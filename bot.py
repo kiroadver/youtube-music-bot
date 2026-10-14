@@ -1,6 +1,7 @@
 import os
 import re
 import html
+import shutil
 import asyncio
 import logging
 
@@ -29,6 +30,17 @@ MAX_FILESIZE = MAX_FILESIZE_MB * 1024 * 1024
 MAX_DURATION = 15 * 60
 MAX_RESULTS = 5
 DOWNLOAD_DIR = "/tmp/ytmusic-bot"
+DOWNLOAD_TIMEOUT = 120  # seconds per download
+SEARCH_TIMEOUT = 20  # seconds per search
+
+YDL_OPTS_BASE = {
+    "quiet": True,
+    "no_warnings": True,
+    "noplaylist": True,
+    "nocheckcertificate": True,
+    "retries": 2,
+}
+
 
 def _cookie_opts() -> dict:
     if COOKIES_FILE and os.path.exists(COOKIES_FILE):
@@ -38,19 +50,9 @@ def _cookie_opts() -> dict:
 
 def _js_runtime_opts() -> dict:
     """Add deno JS runtime if available (needed to bypass YouTube PO token challenge)."""
-    import shutil
     if shutil.which("deno"):
         return {"js_runtimes": {"deno": {"path": "deno"}}}
     return {}
-
-
-YDL_OPTS_BASE = {
-    "quiet": True,
-    "no_warnings": True,
-    "noplaylist": True,
-    "nocheckcertificate": True,
-    "socket_timeout": 15,
-}
 
 
 def get_filesize_mb(path: str) -> float:
@@ -64,7 +66,7 @@ def fetch_thumbnail(res: dict) -> bytes | None:
         if not url:
             continue
         try:
-            r = requests.get(url, timeout=8)
+            r = requests.get(url, timeout=4)
             if r.status_code == 200 and len(r.content) > 1000:
                 return r.content
         except Exception:
@@ -77,7 +79,7 @@ def search_youtube(query: str, limit: int = MAX_RESULTS) -> list[dict]:
     search_opts = {
         **YDL_OPTS_BASE,
         **_cookie_opts(),
-        **_js_runtime_opts(),
+        "socket_timeout": 8,
         "extract_flat": True,
         "skip_download": True,
     }
@@ -127,6 +129,7 @@ def download_audio(video_url: str) -> tuple[str, dict]:
             {"key": "FFmpegMetadata"},
         ],
         "max_filesize": MAX_FILESIZE,
+        "socket_timeout": 20,
     }
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(video_url, download=True)
@@ -250,6 +253,48 @@ async def send_audio_message(
             os.remove(filepath)
 
 
+async def send_song(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                   results: list[dict], index: int, status) -> None:
+    """Send song card + audio. Reuse cached file_id if available (fast path)."""
+    res = results[index]
+    file_id = context.user_data.get("file_ids", {}).get(res["id"])
+    if file_id:
+        try:
+            size_mb = context.user_data.get("sizes", {}).get(res["id"], 0)
+            await update.effective_message.reply_audio(
+                file_id,
+                caption=build_song_card(res, size_mb),
+                parse_mode=ParseMode.HTML,
+                reply_markup=build_results_keyboard(results, index),
+            )
+            await status.edit_text("✅ Terkirim.")
+            await asyncio.sleep(2)
+            await status.delete()
+        except Exception as e:
+            logging.exception("cached send failed, falling back to download: %s", e)
+            await status.edit_text("⏳ Mengunduh ulang…", parse_mode=ParseMode.PLAIN)
+        else:
+            return
+
+    await status.edit_text(
+        f"⏳ Download: <b>{html.escape(truncate(res['title'], 60))}</b>…",
+        parse_mode=ParseMode.HTML,
+    )
+    await update.effective_chat.send_action(ChatAction.UPLOAD_VOICE)
+    try:
+        filepath, _info = await asyncio.wait_for(
+            asyncio.to_thread(download_audio, res["url"]), timeout=DOWNLOAD_TIMEOUT
+        )
+    except asyncio.TimeoutError:
+        await status.edit_text("❌ Timeout download. Coba lagi atau pilih hasil lain.")
+        return
+    except Exception as e:
+        logging.exception("download failed: %s", e)
+        await status.edit_text("❌ Gagal download lagu. Coba judul lain.")
+        return
+    await send_audio_message(update, context, res, results, index, filepath, status)
+
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(HELP_TEXT, parse_mode=ParseMode.HTML)
 
@@ -288,7 +333,12 @@ async def handle_direct(update: Update, context: ContextTypes.DEFAULT_TYPE, text
     status = await update.message.reply_text("⏳ Mengambil lagu…")
     await update.effective_chat.send_action(ChatAction.UPLOAD_VOICE)
     try:
-        filepath, info = await asyncio.to_thread(download_audio, url)
+        filepath, info = await asyncio.wait_for(
+            asyncio.to_thread(download_audio, url), timeout=DOWNLOAD_TIMEOUT
+        )
+    except asyncio.TimeoutError:
+        await status.edit_text("❌ Timeout download. Coba lagi.")
+        return
     except Exception as e:
         logging.exception("direct dl failed: %s", e)
         await status.edit_text("❌ Gagal download. Link mungkin gak valid.")
@@ -315,7 +365,12 @@ async def handle_search(update: Update, context: ContextTypes.DEFAULT_TYPE, quer
         f"🔍 Mencari: <b>{html.escape(query)}</b>…", parse_mode=ParseMode.HTML
     )
     try:
-        results = await asyncio.to_thread(search_youtube, query)
+        results = await asyncio.wait_for(
+            asyncio.to_thread(search_youtube, query), timeout=SEARCH_TIMEOUT
+        )
+    except asyncio.TimeoutError:
+        await status.edit_text("❌ Timeout search. Coba lagi.")
+        return
     except Exception as e:
         logging.exception("search failed: %s", e)
         await status.edit_text("❌ Gagal search. Coba lagi nanti.")
@@ -329,22 +384,6 @@ async def handle_search(update: Update, context: ContextTypes.DEFAULT_TYPE, quer
     context.user_data["current"] = 0
 
     await send_song(update, context, results, 0, status)
-
-
-async def send_song(update: Update, context: ContextTypes.DEFAULT_TYPE, results: list[dict], index: int, status):
-    res = results[index]
-    await status.edit_text(
-        f"⏳ Download: <b>{html.escape(truncate(res['title'], 60))}</b>…",
-        parse_mode=ParseMode.HTML,
-    )
-    await update.effective_chat.send_action(ChatAction.UPLOAD_VOICE)
-    try:
-        filepath, info = await asyncio.to_thread(download_audio, res["url"])
-    except Exception as e:
-        logging.exception("download failed: %s", e)
-        await status.edit_text("❌ Gagal download lagu. Coba judul lain.")
-        return
-    await send_audio_message(update, context, res, results, index, filepath, status)
 
 
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -374,7 +413,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
         status = await q.message.reply_text(
-            f"⏳ Download: <b>{html.escape(truncate(results[index]['title'], 60))}</b>…",
+            f"⏳ Sedang siapkan: <b>{html.escape(truncate(results[index]['title'], 60))}</b>…",
             parse_mode=ParseMode.HTML,
         )
         await send_song(update, context, results, index, status)
@@ -388,9 +427,10 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.answer()
             status = await q.message.reply_text("⏳ Mengirim ulang audio…")
             try:
+                size_mb = context.user_data.get("sizes", {}).get(res["id"], 0)
                 await update.effective_message.reply_audio(
                     file_id,
-                    caption=build_song_card(res, context.user_data.get("sizes", {}).get(res["id"], 0)),
+                    caption=build_song_card(res, size_mb),
                     parse_mode=ParseMode.HTML,
                     reply_markup=build_results_keyboard(results, index),
                 )
@@ -408,7 +448,6 @@ def main():
     if not BOT_TOKEN:
         raise SystemExit("Set BOT_TOKEN env var. Get token dari @BotFather.")
 
-    import shutil
     if shutil.which("ffmpeg") is None:
         raise SystemExit(
             "ffmpeg gak ketemu. Install dulu: sudo apt install ffmpeg (Debian/Ubuntu)"
