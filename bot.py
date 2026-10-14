@@ -23,11 +23,18 @@ logging.basicConfig(
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+COOKIES_FILE = os.environ.get("YTDLP_COOKIES", "")  # optional, for bot-blocked IPs
 MAX_FILESIZE_MB = 50
 MAX_FILESIZE = MAX_FILESIZE_MB * 1024 * 1024
 MAX_DURATION = 15 * 60
 MAX_RESULTS = 5
 DOWNLOAD_DIR = "/tmp/ytmusic-bot"
+
+def _cookie_opts() -> dict:
+    if COOKIES_FILE and os.path.exists(COOKIES_FILE):
+        return {"cookiefile": COOKIES_FILE}
+    return {}
+
 
 YDL_OPTS_BASE = {
     "quiet": True,
@@ -59,7 +66,12 @@ def fetch_thumbnail(res: dict) -> bytes | None:
 
 def search_youtube(query: str, limit: int = MAX_RESULTS) -> list[dict]:
     """Search YouTube, skip mixes/live/long results, return list of dicts."""
-    search_opts = {**YDL_OPTS_BASE, "extract_flat": True, "skip_download": True}
+    search_opts = {
+        **YDL_OPTS_BASE,
+        **_cookie_opts(),
+        "extract_flat": True,
+        "skip_download": True,
+    }
     url = f"ytsearch{limit}:{query}"
     with yt_dlp.YoutubeDL(search_opts) as ydl:
         info = ydl.extract_info(url, download=False)
@@ -93,6 +105,7 @@ def download_audio(video_url: str) -> tuple[str, dict]:
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
     opts = {
         **YDL_OPTS_BASE,
+        **_cookie_opts(),
         "format": "bestaudio/best",
         "outtmpl": os.path.join(DOWNLOAD_DIR, "%(id)s.%(ext)s"),
         "postprocessors": [
@@ -389,6 +402,12 @@ def main():
     if shutil.which("ffmpeg") is None:
         raise SystemExit(
             "ffmpeg gak ketemu. Install dulu: sudo apt install ffmpeg (Debian/Ubuntu)"
+        )
+
+    if not COOKIES_FILE:
+        logging.warning(
+            "YTDLP_COOKIES belum di-set. Kalau download kena blokir bot, "
+            "export cookies dari browser ke file .txt lalu set env YTDLP_COOKIES."
         )
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()

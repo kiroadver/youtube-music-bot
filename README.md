@@ -159,9 +159,24 @@ sudo systemctl status yt-music-bot
 |---|---|
 | Bot gak start, `Set BOT_TOKEN` | Token belum di-set. Cek export/.env, token harus dari BotFather |
 | `ffmpeg: command not found` | Install ffmpeg: `sudo apt install ffmpeg` |
-| Download gagal / stuck | Bisa jadi YouTube update anti-scraping. Upgrade: `pip install -U yt-dlp` |
+| `Sign in to confirm you're not a bot` | IP server kamu diblokir YouTube. Export cookies dari browser (pake extention "Get cookies.txt") simpan jadi `cookies.txt`, lalu set `YTDLP_COOKIES=/path/cookies.txt` di env var. Pake IP residential / VPS non-datacenter juga bisa |
+| Download gagal / stuck | YouTube update anti-scraping. Upgrade: `pip install -U yt-dlp` |
 | File > 50 MB ditolak | Sudah di-limit, cari versi lagu lebih pendek atau pake link lain |
 | Bot lambat | Tambahin caching / pake VPS dengan koneksi bagus |
+
+### 🍪 Setup Cookies (kalau download kena blokir bot)
+
+1. Di browser (Chrome/Firefox), install extension **"Get cookies.txt LOCALLY"**
+2. Buka youtube.com, login ke akun Google
+3. Export cookies, simpan filenya (misal `cookies.txt`)
+4. Di Railway: **Variables → tambah `YTDLP_COOKIES`** → isi path file cookies
+   (upload file cookies via **Volumes** atau tempel isinya ke env var `YTDLP_COOKIES` sebagai path di container)
+
+Cara paling gampang di Railway:
+- Upload `cookies.txt` ke repo (tambahin di `.gitignore` kebalik / pake Railway **Volumes**)
+- Set env var `YTDLP_COOKIES=/data/cookies.txt`
+
+> ⚠️ Jangan commit cookies ke GitHub (sudah di `.gitignore`).
 
 ## ⚖️ Disclaimer
 
