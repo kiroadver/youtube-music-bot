@@ -26,6 +26,7 @@ logging.basicConfig(
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID", "")  # optional, gets full error tracebacks
 COOKIES_FILE = os.environ.get("YTDLP_COOKIES", "")  # optional, for bot-blocked IPs
 MAX_FILESIZE_MB = 50
 MAX_FILESIZE = MAX_FILESIZE_MB * 1024 * 1024
@@ -59,6 +60,36 @@ def is_bot_blocked_error(e: Exception) -> bool:
             "the page needs to be reloaded",
         )
     )
+
+
+def short_error(e: Exception, limit: int = 200) -> str:
+    """Extract a readable one-line error for Telegram."""
+    msg = str(e).strip().split("\n")[0]
+    # Strip yt-dlp "ERROR: " prefix noise
+    msg = re.sub(r"^ERROR:\s*(\[[\w-]+\]\s*[\w-]*:?\s*)?", "", msg)
+    return msg if len(msg) <= limit else msg[: limit - 1] + "…"
+
+
+async def report_error(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                      where: str, e: Exception) -> None:
+    """Log error + send detail to user chat + forward full traceback to admin."""
+    logging.exception("%s failed: %s", where, e)
+    detail = short_error(e)
+    if ADMIN_CHAT_ID:
+        try:
+            user = update.effective_user
+            who = f"@{user.username}" if user and user.username else (user.id if user else "?")
+            await context.bot.send_message(
+                ADMIN_CHAT_ID,
+                f"⚠️ <b>Error di {html.escape(where)}</b>\n"
+                f"👤 User: {html.escape(str(who))}\n"
+                f"💬 Chat: <code>{update.effective_chat.id}</code>\n"
+                f"❌ <code>{html.escape(detail)}</code>",
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            pass
+    return detail
 
 
 def _cookie_opts() -> dict:
@@ -346,8 +377,11 @@ async def handle_direct(update: Update, context: ContextTypes.DEFAULT_TYPE, text
         await status.edit_text("❌ Timeout download. Coba lagi.")
         return
     except Exception as e:
-        logging.exception("direct dl failed: %s", e)
-        await status.edit_text("❌ Gagal download. Link mungkin gak valid.")
+        detail = await report_error(update, context, "direct-download", e)
+        await status.edit_text(
+            f"❌ Gagal download. Link mungkin gak valid.\n\n<i>Detail: {html.escape(detail)}</i>",
+            parse_mode=ParseMode.HTML,
+        )
         return
     res = {
         "id": info.get("id", ""),
@@ -387,13 +421,18 @@ async def handle_search(update: Update, context: ContextTypes.DEFAULT_TYPE, quer
         await status.edit_text("❌ Timeout search. Coba lagi.")
         return
     except Exception as e:
-        logging.exception("search failed: %s", e)
+        detail = await report_error(update, context, "search", e)
         if is_bot_blocked_error(e):
             await status.edit_text(
-                "❌ YouTube ngeblokir server (bot-check). Coba lagi 1–2 menit."
+                "❌ YouTube ngeblokir server (bot-check). Coba lagi 1–2 menit.\n\n"
+                f"<i>Detail: {html.escape(detail)}</i>",
+                parse_mode=ParseMode.HTML,
             )
         else:
-            await status.edit_text("❌ Gagal search. Coba lagi nanti.")
+            await status.edit_text(
+                f"❌ Gagal search. Coba lagi nanti.\n\n<i>Detail: {html.escape(detail)}</i>",
+                parse_mode=ParseMode.HTML,
+            )
         return
 
     if not results:
@@ -440,14 +479,19 @@ async def send_song(update: Update, context: ContextTypes.DEFAULT_TYPE,
         await status.edit_text("❌ Timeout download. Coba lagi atau pilih hasil lain.")
         return
     except Exception as e:
-        logging.exception("download failed: %s", e)
+        detail = await report_error(update, context, "download", e)
         if is_bot_blocked_error(e):
             await status.edit_text(
                 "❌ YouTube ngeblokir server (bot-check).\n"
-                "Coba lagi 1–2 menit. Kalau masih gagal, admin perlu update cookies."
+                "Coba lagi 1–2 menit. Kalau masih gagal, admin perlu update cookies.\n\n"
+                f"<i>Detail: {html.escape(detail)}</i>",
+                parse_mode=ParseMode.HTML,
             )
         else:
-            await status.edit_text("❌ Gagal download lagu. Coba judul lain.")
+            await status.edit_text(
+                f"❌ Gagal download lagu. Coba judul lain.\n\n<i>Detail: {html.escape(detail)}</i>",
+                parse_mode=ParseMode.HTML,
+            )
         return
 
     filesize_mb = get_filesize_mb(filepath) if os.path.exists(filepath) else 0
