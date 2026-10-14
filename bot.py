@@ -45,7 +45,7 @@ YDL_OPTS_BASE = {
     "retries": 2,
     # Try android/tv clients first — they bypass the web PO-token challenge
     # that causes "Sign in to confirm you're not a bot" on server IPs.
-    "extractor_args": {"youtube": {"player_client": ["web_embedded", "android", "tv", "web"]}},
+    "extractor_args": {"youtube": {"player_client": ["web_embedded", "android", "tv", "web"], "player_skip": ["webpage", "configs"]}},
 }
 
 
@@ -505,7 +505,7 @@ async def cmd_health(update: Update, context: ContextTypes.DEFAULT_TYPE):
             **YDL_OPTS_BASE,
             **_cookie_opts(),
             **_js_runtime_opts(),
-            "extractor_args": {"youtube": {"player_client": ["web_embedded", "android", "tv", "web"]}},
+            "extractor_args": {"youtube": {"player_client": ["web_embedded", "android", "tv", "web"], "player_skip": ["webpage", "configs"]}},
             "socket_timeout": 10,
         }
         with yt_dlp.YoutubeDL(opts) as ydl:
