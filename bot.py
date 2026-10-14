@@ -41,7 +41,24 @@ YDL_OPTS_BASE = {
     "noplaylist": True,
     "nocheckcertificate": True,
     "retries": 2,
+    # Try android/tv clients first — they bypass the web PO-token challenge
+    # that causes "Sign in to confirm you're not a bot" on server IPs.
+    "extractor_args": {"youtube": {"player_client": ["android", "tv", "web"]}},
 }
+
+
+def is_bot_blocked_error(e: Exception) -> bool:
+    msg = str(e).lower()
+    return any(
+        k in msg
+        for k in (
+            "sign in to confirm",
+            "not a bot",
+            "http error 429",
+            "too many requests",
+            "the page needs to be reloaded",
+        )
+    )
 
 
 def _cookie_opts() -> dict:
@@ -371,7 +388,12 @@ async def handle_search(update: Update, context: ContextTypes.DEFAULT_TYPE, quer
         return
     except Exception as e:
         logging.exception("search failed: %s", e)
-        await status.edit_text("❌ Gagal search. Coba lagi nanti.")
+        if is_bot_blocked_error(e):
+            await status.edit_text(
+                "❌ YouTube ngeblokir server (bot-check). Coba lagi 1–2 menit."
+            )
+        else:
+            await status.edit_text("❌ Gagal search. Coba lagi nanti.")
         return
 
     if not results:
@@ -419,7 +441,13 @@ async def send_song(update: Update, context: ContextTypes.DEFAULT_TYPE,
         return
     except Exception as e:
         logging.exception("download failed: %s", e)
-        await status.edit_text("❌ Gagal download lagu. Coba judul lain.")
+        if is_bot_blocked_error(e):
+            await status.edit_text(
+                "❌ YouTube ngeblokir server (bot-check).\n"
+                "Coba lagi 1–2 menit. Kalau masih gagal, admin perlu update cookies."
+            )
+        else:
+            await status.edit_text("❌ Gagal download lagu. Coba judul lain.")
         return
 
     filesize_mb = get_filesize_mb(filepath) if os.path.exists(filepath) else 0
