@@ -163,7 +163,7 @@ def search_youtube(query: str, limit: int = MAX_RESULTS) -> list[dict]:
 
 def download_audio(video_url: str, progress_hooks: list | None = None,
                    pp_hooks: list | None = None) -> tuple[str, dict]:
-    """Download audio as MP3 (requires ffmpeg), return (filepath, info)."""
+    """Download best audio only (no conversion here), return (filepath, info)."""
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
     opts = {
         **YDL_OPTS_BASE,
@@ -171,13 +171,6 @@ def download_audio(video_url: str, progress_hooks: list | None = None,
         **_js_runtime_opts(),
         "format": "bestaudio/best",
         "outtmpl": os.path.join(DOWNLOAD_DIR, "%(id)s.%(ext)s"),
-        "postprocessors": [
-            {
-                "key": "FFmpegExtractAudio",
-                "preferredcodec": "mp3",
-                "preferredquality": "192",
-            },
-        ],
         "max_filesize": MAX_FILESIZE,
         "socket_timeout": 20,
         "retries": 1,
@@ -190,11 +183,32 @@ def download_audio(video_url: str, progress_hooks: list | None = None,
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(video_url, download=True)
         filepath = ydl.prepare_filename(info)
-        if not filepath.endswith(".mp3"):
-            mp3 = os.path.splitext(filepath)[0] + ".mp3"
-            if os.path.exists(mp3):
-                filepath = mp3
     return filepath, info
+
+
+def convert_to_mp3(src: str, timeout_s: int = 90) -> str:
+    """Convert audio to MP3 via ffmpeg with a hard timeout (never hangs forever)."""
+    import subprocess
+    if src.lower().endswith(".mp3"):
+        return src
+    dst = os.path.splitext(src)[0] + ".mp3"
+    cmd = [
+        "timeout", str(timeout_s),
+        "ffmpeg", "-y", "-loglevel", "error",
+        "-i", src, "-vn", "-c:a", "libmp3lame", "-b:a", "192k", dst,
+    ]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s + 10)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("ffmpeg hang > 90 detik, dibatalkan.")
+    if r.returncode != 0 or not os.path.exists(dst):
+        err = (r.stderr or "").strip().split("\n")[-1][:200]
+        raise RuntimeError(f"ffmpeg gagal (code {r.returncode}): {err}")
+    try:
+        os.remove(src)
+    except Exception:
+        pass
+    return dst
 
 
 async def download_with_progress(url: str, status, title: str) -> tuple[str, dict]:
@@ -223,14 +237,11 @@ async def download_with_progress(url: str, status, title: str) -> tuple[str, dic
             pass
 
     loop = asyncio.get_event_loop()
-    task = loop.run_in_executor(None, lambda: download_audio(url, [hook], [pp_hook]))
-    last_text = ""
     start = loop.time()
-    while not task.done():
-        elapsed_total = int(loop.time() - start)
-        if elapsed_total > DOWNLOAD_TIMEOUT:
-            raise asyncio.TimeoutError
-        await asyncio.sleep(4)
+    last_text = ""
+
+    async def pump_status():
+        nonlocal last_text
         if state["phase"] == "convert":
             conv_elapsed = int(time.monotonic() - state.get("convert_start", time.monotonic()))
             text = (
@@ -251,7 +262,32 @@ async def download_with_progress(url: str, status, title: str) -> tuple[str, dic
                 await status.edit_text(text, parse_mode=ParseMode.HTML)
             except Exception:
                 pass
-    return task.result()
+
+    # Phase 1: download (max 120s)
+    dl_task = loop.run_in_executor(None, lambda: download_audio(url, [hook], [pp_hook]))
+    while not dl_task.done():
+        if loop.time() - start > 120:
+            raise asyncio.TimeoutError("download")
+        await asyncio.sleep(4)
+        await pump_status()
+    filepath, info = dl_task.result()
+
+    # Phase 2: convert with hard timeout (max 100s), timer keeps ticking
+    state["phase"] = "convert"
+    state["convert_start"] = time.monotonic()
+    conv_task = loop.run_in_executor(None, lambda: convert_to_mp3(filepath, timeout_s=90))
+    while not conv_task.done():
+        if loop.time() - start > DOWNLOAD_TIMEOUT:
+            raise asyncio.TimeoutError("convert")
+        await asyncio.sleep(4)
+        await pump_status()
+    mp3_path = conv_task.result()
+
+    await status.edit_text(
+        f"📤 Mengirim ke Telegram…\n<b>{html.escape(truncate(title, 50))}</b>",
+        parse_mode=ParseMode.HTML,
+    )
+    return mp3_path, info
 
 
 def format_duration(seconds) -> str:
