@@ -283,8 +283,9 @@ async def download_with_progress(url: str, status, title: str) -> tuple[str, dic
         await pump_status()
     mp3_path = conv_task.result()
 
+    size_mb = get_filesize_mb(mp3_path) if os.path.exists(mp3_path) else 0
     await status.edit_text(
-        f"📤 Mengirim ke Telegram…\n<b>{html.escape(truncate(title, 50))}</b>",
+        f"📤 Mengirim {size_mb:.1f} MB ke Telegram…\n<b>{html.escape(truncate(title, 50))}</b>",
         parse_mode=ParseMode.HTML,
     )
     return mp3_path, info
@@ -390,16 +391,22 @@ async def send_media_group(
         if m is not last:
             m.parse_mode = ParseMode.HTML
 
-    msg = await update.effective_message.reply_media_group(media)
+    msg = await asyncio.wait_for(
+        update.effective_message.reply_media_group(media), timeout=180
+    )
     ids = [m.message_id for m in msg]
     context.user_data.setdefault("media_ids", []).extend(ids)
     context.user_data.setdefault("last_group", []).extend(ids)
 
-    # Cache file_id on audio message (last in group)
+    # Cache file_id of the uploaded audio (last item in group) for instant resend
     if audio_file_id:
         context.user_data.setdefault("file_ids", {})[res["id"]] = audio_file_id
     else:
         context.user_data.setdefault("sizes", {})[res["id"]] = filesize_mb
+        for m in msg:
+            if m.audio and m.audio.file_id:
+                context.user_data.setdefault("file_ids", {})[res["id"]] = m.audio.file_id
+                break
 
 
 HELP_TEXT = (
@@ -593,8 +600,25 @@ async def send_song(update: Update, context: ContextTypes.DEFAULT_TYPE,
         return
 
     filesize_mb = get_filesize_mb(filepath) if os.path.exists(filepath) else 0
-    with open(filepath, "rb") as f:
-        await send_media_group(update, context, res, results, index, f, filesize_mb)
+    try:
+        with open(filepath, "rb") as f:
+            await send_media_group(update, context, res, results, index, f, filesize_mb)
+    except asyncio.TimeoutError:
+        detail = await report_error(update, context, "upload", asyncio.TimeoutError("upload > 180s"))
+        await status.edit_text(
+            f"❌ Upload ke Telegram timeout ({filesize_mb:.1f} MB).\n"
+            "Koneksi server lambat — coba lagi atau pilih hasil lain.\n\n"
+            f"<i>Detail: {html.escape(detail)}</i>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    except Exception as e:
+        detail = await report_error(update, context, "upload", e)
+        await status.edit_text(
+            f"❌ Gagal kirim ke Telegram.\n\n<i>Detail: {html.escape(detail)}</i>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
     context.user_data.setdefault("sizes", {})[res["id"]] = filesize_mb
     await status.delete()
     if os.path.exists(filepath):
