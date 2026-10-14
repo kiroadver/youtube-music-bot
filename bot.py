@@ -343,6 +343,30 @@ async def clear_previous_media(update: Update, context: ContextTypes.DEFAULT_TYP
     context.user_data["media_ids"] = []
 
 
+async def send_photo_card(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                        results: list[dict], index: int) -> None:
+    """Send ONE photo message: big cover + info card + result buttons."""
+    res = results[index]
+    await clear_previous_media(update, context)
+    thumb = await asyncio.to_thread(fetch_thumbnail, res)
+    kb = build_results_keyboard(results, index)
+    if thumb:
+        msg = await update.effective_message.reply_photo(
+            io.BytesIO(thumb),
+            caption=build_song_card(res, context.user_data.get("sizes", {}).get(res["id"], 0)),
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb,
+        )
+    else:
+        msg = await update.effective_message.reply_text(
+            build_song_card(res, 0),
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb,
+        )
+    context.user_data["media_ids"] = [msg.message_id]
+    context.user_data["current"] = index
+
+
 async def send_media_group(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -399,12 +423,12 @@ HELP_TEXT = (
     "<code>/play judul lagu</code>\n"
     "Contoh: <code>/play tulus monokrom</code>\n\n"
     "Bot bakal kirim 1 pesan berisi:\n"
-    "• 🖼️ Cover lagu (nempel di player audio)\n"
-    "• 🎵 Judul, 👤 artis, ⏱️ durasi, 💾 ukuran, 🔗 link\n"
-    "• 🎧 File MP3-nya + tombol pilih hasil lain\n\n"
+    "• 🖼️ Cover besar + 🎵 judul, 👤 artis, ⏱️ durasi, 🔗 link\n"
+    "• Tombol judul lagu buat pilih hasil lain\n"
+    "• 🎵 Kirim Audio → baru kirim file MP3-nya\n\n"
     "2) <b>Hasil pertama bukan yang lu mau?</b>\n"
-    "Klik tombol judul lagu di bawah kartu. Pesan lama otomatis dibersihkan,\n"
-    "pesan baru (cover + audio pilihan baru) langsung tampil.\n\n"
+    "Klik tombol judul lagu. Pesan lama otomatis dibersihkan,\n"
+    "kartu baru (cover + info pilihan baru) langsung tampil.\n\n"
     "3) <b>Download langsung</b>\n"
     "<code>/dl judul lagu</code>\n"
     "Atau kirim link YouTube-nya langsung.\n\n"
@@ -530,7 +554,8 @@ async def handle_search(update: Update, context: ContextTypes.DEFAULT_TYPE, quer
     context.user_data["current"] = 0
     context.user_data["media_ids"] = []
 
-    await send_song(update, context, results, 0, status)
+    await status.delete()
+    await send_photo_card(update, context, results, 0)
 
 
 async def send_song(update: Update, context: ContextTypes.DEFAULT_TYPE,
@@ -625,12 +650,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         index = int(data.split(":")[1])
         if index >= len(results):
             return
-        context.user_data["current"] = index
-        status = await q.message.reply_text(
-            f"⏳ Sedang siapkan: <b>{html.escape(truncate(results[index]['title'], 60))}</b>…",
-            parse_mode=ParseMode.HTML,
-        )
-        await send_song(update, context, results, index, status)
+        await send_photo_card(update, context, results, index)
         return
 
     if data == "send_audio":
@@ -638,16 +658,8 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         res = results[index]
         file_id = context.user_data.get("file_ids", {}).get(res["id"])
         await q.answer()
-        status = await q.message.reply_text("⏳ Mengirim ulang audio…")
-        if file_id:
-            size_mb = context.user_data.get("sizes", {}).get(res["id"], 0)
-            await send_media_group(
-                update, context, res, results, index, None, size_mb,
-                audio_file_id=file_id,
-            )
-            await status.delete()
-        else:
-            await send_song(update, context, results, index, status)
+        status = await q.message.reply_text("⏳ Mengirim audio…")
+        await send_song(update, context, results, index, status)
 
 
 def main():
