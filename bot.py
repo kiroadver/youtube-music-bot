@@ -27,8 +27,7 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID", "")  # optional, gets full error tracebacks
-COOKIES_FILE = os.environ.get("YTDLP_COOKIES", "")  # optional: path to cookies.txt
-COOKIES_CONTENT = os.environ.get("YTDLP_COOKIES_CONTENT", "")  # optional: raw cookies.txt pasted here
+COOKIES_FILE = os.environ.get("YTDLP_COOKIES", "")  # optional, for bot-blocked IPs
 MAX_FILESIZE_MB = 50
 MAX_FILESIZE = MAX_FILESIZE_MB * 1024 * 1024
 MAX_DURATION = 15 * 60
@@ -63,7 +62,7 @@ def is_bot_blocked_error(e: Exception) -> bool:
     )
 
 
-def short_error(e: Exception, limit: int = 400) -> str:
+def short_error(e: Exception, limit: int = 200) -> str:
     """Extract a readable one-line error for Telegram."""
     msg = str(e).strip().split("\n")[0]
     # Strip yt-dlp "ERROR: " prefix noise
@@ -94,90 +93,9 @@ async def report_error(update: Update, context: ContextTypes.DEFAULT_TYPE,
 
 
 def _cookie_opts() -> dict:
-    path = COOKIES_FILE
-    # Allow pasting the whole cookies.txt into an env var (easier on Railway:
-    # no volume upload needed). Written to /tmp at startup.
-    if COOKIES_CONTENT and "youtube.com" in COOKIES_CONTENT:
-        path = "/tmp/ytmusic-cookies.txt"
-        try:
-            with open(path, "w") as f:
-                f.write(COOKIES_CONTENT)
-                if not COOKIES_CONTENT.endswith("\n"):
-                    f.write("\n")
-        except Exception as e:
-            logging.warning("could not write cookies from env: %s", e)
-            path = ""
-    if path and os.path.exists(path):
-        return {"cookiefile": path}
+    if COOKIES_FILE and os.path.exists(COOKIES_FILE):
+        return {"cookiefile": COOKIES_FILE}
     return {}
-
-
-PIPED_INSTANCES = [
-    "https://pipedapi.kavin.rocks",
-    "https://pipedapi.adminforge.de",
-    "https://pipedapi.reallyaweso.me",
-    "https://api-piped.mha.fi",
-]
-
-
-def download_via_piped(video_url: str) -> tuple[str, dict]:
-    """Fallback: get audio stream URL from Piped API, download directly."""
-    m = re.search(r"(?:v=|youtu\.be/|shorts/)([\w-]{11})", video_url)
-    if not m:
-        raise RuntimeError("link tidak valid")
-    vid = m.group(1)
-    last_err: Exception | str | None = None
-    for base in PIPED_INSTANCES:
-        try:
-            r = requests.get(f"{base}/streams/{vid}", timeout=15)
-            r.raise_for_status()
-            data = r.json()
-            streams = data.get("audioStreams") or []
-            if not streams:
-                last_err = "no audioStreams"
-                continue
-
-            def _key(s):
-                codec = (s.get("codec") or "").lower()
-                pref = 0 if "mp4a" in codec or "m4a" in codec else 1
-                return (pref, -(s.get("bitrate") or 0))
-
-            s = sorted(streams, key=_key)[0]
-            url = s.get("url")
-            if not url:
-                last_err = "no stream url"
-                continue
-            codec = (s.get("codec") or "").lower()
-            ext = "m4a" if ("mp4" in codec or "mp4a" in codec) else "webm"
-            os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-            fp = os.path.join(DOWNLOAD_DIR, f"{vid}.{ext}")
-            with requests.get(url, stream=True, timeout=20) as dl:
-                dl.raise_for_status()
-                size = 0
-                with open(fp, "wb") as f:
-                    for chunk in dl.iter_content(1024 * 256):
-                        if not chunk:
-                            continue
-                        f.write(chunk)
-                        size += len(chunk)
-                        if size > MAX_FILESIZE:
-                            raise RuntimeError("file > 50 MB")
-            if os.path.getsize(fp) < 50_000:
-                raise RuntimeError("file terlalu kecil, kemungkinan error")
-            info = {
-                "id": vid,
-                "title": data.get("title", "Unknown"),
-                "uploader": data.get("uploader", "-"),
-                "duration": data.get("duration", 0),
-                "url": f"https://www.youtube.com/watch?v={vid}",
-                "thumbnail": data.get("thumbnailUrl", ""),
-            }
-            logging.info("piped ok via %s", base)
-            return fp, info
-        except Exception as e:
-            last_err = e
-            logging.warning("piped %s failed: %s", base, str(e)[:120])
-    raise RuntimeError(f"piped fallback gagal: {last_err}")
 
 
 def _js_runtime_opts() -> dict:
@@ -244,50 +162,27 @@ def search_youtube(query: str, limit: int = MAX_RESULTS) -> list[dict]:
 
 def download_audio(video_url: str, progress_hooks: list | None = None,
                    pp_hooks: list | None = None) -> tuple[str, dict]:
-    """Download best audio only (no conversion here), return (filepath, info).
-
-    Tries multiple player clients in order; first success wins.
-    """
+    """Download best audio only (no conversion here), return (filepath, info)."""
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-
-    # Attempt 1: yt-dlp with all clients combined (formats get merged),
-    # cookies + deno JS solver. Try audio-only first, then any muxed format.
-    errs: list[str] = []
-    for fmt in ("bestaudio[ext=m4a]/bestaudio/best", "best"):
-        opts = {
-            **YDL_OPTS_BASE,
-            **_cookie_opts(),
-            **_js_runtime_opts(),
-            "extractor_args": {"youtube": {"player_client": ["android", "tv", "web"]}},
-            "format": fmt,
-            "outtmpl": os.path.join(DOWNLOAD_DIR, "%(id)s.%(ext)s"),
-            "max_filesize": MAX_FILESIZE,
-            "socket_timeout": 20,
-            "retries": 1,
-            "fragment_retries": 1,
-        }
-        if progress_hooks:
-            opts["progress_hooks"] = progress_hooks
-        if pp_hooks:
-            opts["postprocessor_hooks"] = pp_hooks
-        try:
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(video_url, download=True)
-                filepath = ydl.prepare_filename(info)
-            logging.info("download ok via yt-dlp (format %s)", fmt)
-            return filepath, info
-        except Exception as e:
-            msg = str(e).strip().split("\n")[0][:150]
-            errs.append(f"ytdlp[{fmt}]: {msg}")
-            logging.warning("yt-dlp format %s failed: %s", fmt, msg)
-
-    # Attempt 2: Piped API fallback (no YouTube player needed at all)
-    try:
-        return download_via_piped(video_url)
-    except Exception as e:
-        errs.append(f"piped: {str(e).strip().splitlines()[0][:150] if str(e).strip().splitlines() else e}")
-
-    raise RuntimeError("download gagal semua jalur: " + " | ".join(errs))
+    opts = {
+        **YDL_OPTS_BASE,
+        **_cookie_opts(),
+        **_js_runtime_opts(),
+        "format": "bestaudio/best",
+        "outtmpl": os.path.join(DOWNLOAD_DIR, "%(id)s.%(ext)s"),
+        "max_filesize": MAX_FILESIZE,
+        "socket_timeout": 20,
+        "retries": 1,
+        "fragment_retries": 1,
+    }
+    if progress_hooks:
+        opts["progress_hooks"] = progress_hooks
+    if pp_hooks:
+        opts["postprocessor_hooks"] = pp_hooks
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(video_url, download=True)
+        filepath = ydl.prepare_filename(info)
+    return filepath, info
 
 
 def convert_to_mp3(src: str, timeout_s: int = 90) -> str:
@@ -448,30 +343,6 @@ async def clear_previous_media(update: Update, context: ContextTypes.DEFAULT_TYP
     context.user_data["media_ids"] = []
 
 
-async def send_photo_card(update: Update, context: ContextTypes.DEFAULT_TYPE,
-                        results: list[dict], index: int) -> None:
-    """Send ONE photo message: big cover + info card + result buttons."""
-    res = results[index]
-    await clear_previous_media(update, context)
-    thumb = await asyncio.to_thread(fetch_thumbnail, res)
-    kb = build_results_keyboard(results, index)
-    if thumb:
-        msg = await update.effective_message.reply_photo(
-            io.BytesIO(thumb),
-            caption=build_song_card(res, context.user_data.get("sizes", {}).get(res["id"], 0)),
-            parse_mode=ParseMode.HTML,
-            reply_markup=kb,
-        )
-    else:
-        msg = await update.effective_message.reply_text(
-            build_song_card(res, 0),
-            parse_mode=ParseMode.HTML,
-            reply_markup=kb,
-        )
-    context.user_data["media_ids"] = [msg.message_id]
-    context.user_data["current"] = index
-
-
 async def send_media_group(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -528,12 +399,12 @@ HELP_TEXT = (
     "<code>/play judul lagu</code>\n"
     "Contoh: <code>/play tulus monokrom</code>\n\n"
     "Bot bakal kirim 1 pesan berisi:\n"
-    "• 🖼️ Cover besar + 🎵 judul, 👤 artis, ⏱️ durasi, 🔗 link\n"
-    "• Tombol judul lagu buat pilih hasil lain\n"
-    "• 🎵 Kirim Audio → baru kirim file MP3-nya\n\n"
+    "• 🖼️ Cover lagu (nempel di player audio)\n"
+    "• 🎵 Judul, 👤 artis, ⏱️ durasi, 💾 ukuran, 🔗 link\n"
+    "• 🎧 File MP3-nya + tombol pilih hasil lain\n\n"
     "2) <b>Hasil pertama bukan yang lu mau?</b>\n"
-    "Klik tombol judul lagu. Pesan lama otomatis dibersihkan,\n"
-    "kartu baru (cover + info pilihan baru) langsung tampil.\n\n"
+    "Klik tombol judul lagu di bawah kartu. Pesan lama otomatis dibersihkan,\n"
+    "pesan baru (cover + audio pilihan baru) langsung tampil.\n\n"
     "3) <b>Download langsung</b>\n"
     "<code>/dl judul lagu</code>\n"
     "Atau kirim link YouTube-nya langsung.\n\n"
@@ -659,8 +530,7 @@ async def handle_search(update: Update, context: ContextTypes.DEFAULT_TYPE, quer
     context.user_data["current"] = 0
     context.user_data["media_ids"] = []
 
-    await status.delete()
-    await send_photo_card(update, context, results, 0)
+    await send_song(update, context, results, 0, status)
 
 
 async def send_song(update: Update, context: ContextTypes.DEFAULT_TYPE,
@@ -755,7 +625,12 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         index = int(data.split(":")[1])
         if index >= len(results):
             return
-        await send_photo_card(update, context, results, index)
+        context.user_data["current"] = index
+        status = await q.message.reply_text(
+            f"⏳ Sedang siapkan: <b>{html.escape(truncate(results[index]['title'], 60))}</b>…",
+            parse_mode=ParseMode.HTML,
+        )
+        await send_song(update, context, results, index, status)
         return
 
     if data == "send_audio":
@@ -763,8 +638,16 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         res = results[index]
         file_id = context.user_data.get("file_ids", {}).get(res["id"])
         await q.answer()
-        status = await q.message.reply_text("⏳ Mengirim audio…")
-        await send_song(update, context, results, index, status)
+        status = await q.message.reply_text("⏳ Mengirim ulang audio…")
+        if file_id:
+            size_mb = context.user_data.get("sizes", {}).get(res["id"], 0)
+            await send_media_group(
+                update, context, res, results, index, None, size_mb,
+                audio_file_id=file_id,
+            )
+            await status.delete()
+        else:
+            await send_song(update, context, results, index, status)
 
 
 def main():
@@ -776,10 +659,10 @@ def main():
             "ffmpeg gak ketemu. Install dulu: sudo apt install ffmpeg (Debian/Ubuntu)"
         )
 
-    if not COOKIES_FILE and not COOKIES_CONTENT:
+    if not COOKIES_FILE:
         logging.warning(
-            "YTDLP_COOKIES / YTDLP_COOKIES_CONTENT belum di-set. "
-            "Kalau download kena blokir bot, set salah satunya."
+            "YTDLP_COOKIES belum di-set. Kalau download kena blokir bot, "
+            "export cookies dari browser ke file .txt lalu set env YTDLP_COOKIES."
         )
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
