@@ -112,24 +112,72 @@ def _cookie_opts() -> dict:
     return {}
 
 
-def _player_configs() -> list[dict]:
-    """Ordered player-client configs to try (first success wins).
+PIPED_INSTANCES = [
+    "https://pipedapi.kavin.rocks",
+    "https://pipedapi.adminforge.de",
+    "https://pipedapi.reallyaweso.me",
+    "https://api-piped.mha.fi",
+]
 
-    - android: no login/PO-token needed, often bypasses bot-check
-    - tv + cookies: logged-in TV client
-    - web + cookies + deno: full web client with JS challenge solver
-    """
-    cookie = _cookie_opts()
-    js = _js_runtime_opts()
-    return [
-        {"extractor_args": {"youtube": {"player_client": ["android"]}}},
-        {**cookie, "extractor_args": {"youtube": {"player_client": ["tv"]}}},
-        {
-            **cookie,
-            **js,
-            "extractor_args": {"youtube": {"player_client": ["web"]}},
-        },
-    ]
+
+def download_via_piped(video_url: str) -> tuple[str, dict]:
+    """Fallback: get audio stream URL from Piped API, download directly."""
+    m = re.search(r"(?:v=|youtu\.be/|shorts/)([\w-]{11})", video_url)
+    if not m:
+        raise RuntimeError("link tidak valid")
+    vid = m.group(1)
+    last_err: Exception | str | None = None
+    for base in PIPED_INSTANCES:
+        try:
+            r = requests.get(f"{base}/streams/{vid}", timeout=15)
+            r.raise_for_status()
+            data = r.json()
+            streams = data.get("audioStreams") or []
+            if not streams:
+                last_err = "no audioStreams"
+                continue
+
+            def _key(s):
+                codec = (s.get("codec") or "").lower()
+                pref = 0 if "mp4a" in codec or "m4a" in codec else 1
+                return (pref, -(s.get("bitrate") or 0))
+
+            s = sorted(streams, key=_key)[0]
+            url = s.get("url")
+            if not url:
+                last_err = "no stream url"
+                continue
+            codec = (s.get("codec") or "").lower()
+            ext = "m4a" if ("mp4" in codec or "mp4a" in codec) else "webm"
+            os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+            fp = os.path.join(DOWNLOAD_DIR, f"{vid}.{ext}")
+            with requests.get(url, stream=True, timeout=20) as dl:
+                dl.raise_for_status()
+                size = 0
+                with open(fp, "wb") as f:
+                    for chunk in dl.iter_content(1024 * 256):
+                        if not chunk:
+                            continue
+                        f.write(chunk)
+                        size += len(chunk)
+                        if size > MAX_FILESIZE:
+                            raise RuntimeError("file > 50 MB")
+            if os.path.getsize(fp) < 50_000:
+                raise RuntimeError("file terlalu kecil, kemungkinan error")
+            info = {
+                "id": vid,
+                "title": data.get("title", "Unknown"),
+                "uploader": data.get("uploader", "-"),
+                "duration": data.get("duration", 0),
+                "url": f"https://www.youtube.com/watch?v={vid}",
+                "thumbnail": data.get("thumbnailUrl", ""),
+            }
+            logging.info("piped ok via %s", base)
+            return fp, info
+        except Exception as e:
+            last_err = e
+            logging.warning("piped %s failed: %s", base, str(e)[:120])
+    raise RuntimeError(f"piped fallback gagal: {last_err}")
 
 
 def _js_runtime_opts() -> dict:
@@ -201,12 +249,16 @@ def download_audio(video_url: str, progress_hooks: list | None = None,
     Tries multiple player clients in order; first success wins.
     """
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-    last_err: Exception | None = None
-    for cfg in _player_configs():
+
+    # Attempt 1: yt-dlp with all clients combined (formats get merged),
+    # cookies + deno JS solver. Try audio-only first, then any muxed format.
+    for fmt in ("bestaudio[ext=m4a]/bestaudio/best", "best"):
         opts = {
             **YDL_OPTS_BASE,
-            **cfg,
-            "format": "bestaudio/best",
+            **_cookie_opts(),
+            **_js_runtime_opts(),
+            "extractor_args": {"youtube": {"player_client": ["android", "tv", "web"]}},
+            "format": fmt,
             "outtmpl": os.path.join(DOWNLOAD_DIR, "%(id)s.%(ext)s"),
             "max_filesize": MAX_FILESIZE,
             "socket_timeout": 20,
@@ -221,19 +273,14 @@ def download_audio(video_url: str, progress_hooks: list | None = None,
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(video_url, download=True)
                 filepath = ydl.prepare_filename(info)
-            logging.info(
-                "download ok via %s",
-                cfg.get("extractor_args", {}).get("youtube", {}).get("player_client"),
-            )
+            logging.info("download ok via yt-dlp (format %s)", fmt)
             return filepath, info
         except Exception as e:
-            last_err = e
-            logging.warning(
-                "player %s failed: %s",
-                cfg.get("extractor_args", {}).get("youtube", {}).get("player_client"),
-                str(e)[:150],
-            )
-    raise last_err if last_err else RuntimeError("download gagal semua client")
+            logging.warning("yt-dlp format %s failed: %s", fmt, str(e)[:150])
+
+    # Attempt 2: Piped API fallback (no YouTube player needed at all)
+    logging.warning("yt-dlp failed, trying piped fallback")
+    return download_via_piped(video_url)
 
 
 def convert_to_mp3(src: str, timeout_s: int = 90) -> str:
