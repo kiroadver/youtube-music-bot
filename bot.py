@@ -27,7 +27,8 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID", "")  # optional, gets full error tracebacks
-COOKIES_FILE = os.environ.get("YTDLP_COOKIES", "")  # optional, for bot-blocked IPs
+COOKIES_FILE = os.environ.get("YTDLP_COOKIES", "")  # optional: path to cookies.txt
+COOKIES_CONTENT = os.environ.get("YTDLP_COOKIES_CONTENT", "")  # optional: raw cookies.txt pasted here
 MAX_FILESIZE_MB = 50
 MAX_FILESIZE = MAX_FILESIZE_MB * 1024 * 1024
 MAX_DURATION = 15 * 60
@@ -93,8 +94,21 @@ async def report_error(update: Update, context: ContextTypes.DEFAULT_TYPE,
 
 
 def _cookie_opts() -> dict:
-    if COOKIES_FILE and os.path.exists(COOKIES_FILE):
-        return {"cookiefile": COOKIES_FILE}
+    path = COOKIES_FILE
+    # Allow pasting the whole cookies.txt into an env var (easier on Railway:
+    # no volume upload needed). Written to /tmp at first use.
+    if COOKIES_CONTENT and "youtube.com" in COOKIES_CONTENT:
+        path = "/tmp/ytmusic-cookies.txt"
+        try:
+            with open(path, "w") as f:
+                f.write(COOKIES_CONTENT)
+                if not COOKIES_CONTENT.endswith("\n"):
+                    f.write("\n")
+        except Exception as e:
+            logging.warning("could not write cookies from env: %s", e)
+            path = ""
+    if path and os.path.exists(path):
+        return {"cookiefile": path}
     return {}
 
 
@@ -659,10 +673,10 @@ def main():
             "ffmpeg gak ketemu. Install dulu: sudo apt install ffmpeg (Debian/Ubuntu)"
         )
 
-    if not COOKIES_FILE:
+    if not COOKIES_FILE and not COOKIES_CONTENT:
         logging.warning(
-            "YTDLP_COOKIES belum di-set. Kalau download kena blokir bot, "
-            "export cookies dari browser ke file .txt lalu set env YTDLP_COOKIES."
+            "YTDLP_COOKIES / YTDLP_COOKIES_CONTENT belum di-set. "
+            "Kalau download kena blokir bot, set salah satunya."
         )
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
