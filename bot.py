@@ -63,7 +63,7 @@ def is_bot_blocked_error(e: Exception) -> bool:
     )
 
 
-def short_error(e: Exception, limit: int = 200) -> str:
+def short_error(e: Exception, limit: int = 400) -> str:
     """Extract a readable one-line error for Telegram."""
     msg = str(e).strip().split("\n")[0]
     # Strip yt-dlp "ERROR: " prefix noise
@@ -252,6 +252,7 @@ def download_audio(video_url: str, progress_hooks: list | None = None,
 
     # Attempt 1: yt-dlp with all clients combined (formats get merged),
     # cookies + deno JS solver. Try audio-only first, then any muxed format.
+    errs: list[str] = []
     for fmt in ("bestaudio[ext=m4a]/bestaudio/best", "best"):
         opts = {
             **YDL_OPTS_BASE,
@@ -276,11 +277,17 @@ def download_audio(video_url: str, progress_hooks: list | None = None,
             logging.info("download ok via yt-dlp (format %s)", fmt)
             return filepath, info
         except Exception as e:
-            logging.warning("yt-dlp format %s failed: %s", fmt, str(e)[:150])
+            msg = str(e).strip().split("\n")[0][:150]
+            errs.append(f"ytdlp[{fmt}]: {msg}")
+            logging.warning("yt-dlp format %s failed: %s", fmt, msg)
 
     # Attempt 2: Piped API fallback (no YouTube player needed at all)
-    logging.warning("yt-dlp failed, trying piped fallback")
-    return download_via_piped(video_url)
+    try:
+        return download_via_piped(video_url)
+    except Exception as e:
+        errs.append(f"piped: {str(e).strip().splitlines()[0][:150] if str(e).strip().splitlines() else e}")
+
+    raise RuntimeError("download gagal semua jalur: " + " | ".join(errs))
 
 
 def convert_to_mp3(src: str, timeout_s: int = 90) -> str:
