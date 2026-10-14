@@ -2,6 +2,7 @@ import os
 import re
 import io
 import html
+import time
 import shutil
 import asyncio
 import logging
@@ -33,7 +34,7 @@ MAX_FILESIZE = MAX_FILESIZE_MB * 1024 * 1024
 MAX_DURATION = 15 * 60
 MAX_RESULTS = 5
 DOWNLOAD_DIR = "/tmp/ytmusic-bot"
-DOWNLOAD_TIMEOUT = 120
+DOWNLOAD_TIMEOUT = 180
 SEARCH_TIMEOUT = 20
 
 YDL_OPTS_BASE = {
@@ -160,7 +161,8 @@ def search_youtube(query: str, limit: int = MAX_RESULTS) -> list[dict]:
     return results
 
 
-def download_audio(video_url: str, progress_hooks: list | None = None) -> tuple[str, dict]:
+def download_audio(video_url: str, progress_hooks: list | None = None,
+                   pp_hooks: list | None = None) -> tuple[str, dict]:
     """Download audio as MP3 (requires ffmpeg), return (filepath, info)."""
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
     opts = {
@@ -183,6 +185,8 @@ def download_audio(video_url: str, progress_hooks: list | None = None) -> tuple[
     }
     if progress_hooks:
         opts["progress_hooks"] = progress_hooks
+    if pp_hooks:
+        opts["postprocessor_hooks"] = pp_hooks
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(video_url, download=True)
         filepath = ydl.prepare_filename(info)
@@ -206,19 +210,33 @@ async def download_with_progress(url: str, status, title: str) -> tuple[str, dic
                     state["pct"] = int(done * 100 / total)
             elif d.get("status") == "finished":
                 state["phase"] = "convert"
+                state["convert_start"] = time.monotonic()
+        except Exception:
+            pass
+
+    def pp_hook(d):
+        try:
+            if d.get("status") in ("started", "processing"):
+                state["phase"] = "convert"
+                state.setdefault("convert_start", time.monotonic())
         except Exception:
             pass
 
     loop = asyncio.get_event_loop()
-    task = loop.run_in_executor(None, lambda: download_audio(url, [hook]))
+    task = loop.run_in_executor(None, lambda: download_audio(url, [hook], [pp_hook]))
     last_text = ""
     start = loop.time()
     while not task.done():
-        if loop.time() - start > DOWNLOAD_TIMEOUT:
+        elapsed_total = int(loop.time() - start)
+        if elapsed_total > DOWNLOAD_TIMEOUT:
             raise asyncio.TimeoutError
         await asyncio.sleep(4)
         if state["phase"] == "convert":
-            text = f"⏳ Konversi MP3: <b>{html.escape(truncate(title, 50))}</b>…"
+            conv_elapsed = int(time.monotonic() - state.get("convert_start", time.monotonic()))
+            text = (
+                f"⏳ Konversi MP3… {conv_elapsed}s\n"
+                f"<b>{html.escape(truncate(title, 50))}</b>"
+            )
         elif state["pct"] > 0:
             bar = "█" * (state["pct"] // 10) + "░" * (10 - state["pct"] // 10)
             text = (
