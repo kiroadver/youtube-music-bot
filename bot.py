@@ -47,8 +47,16 @@ YDL_OPTS_BASE = {
 
 # Player clients tried one-by-one (first success wins). Embedded/music
 # clients face lighter bot-checks than the main web client.
-PLAYER_CLIENTS = ["web_embedded", "android_music", "android", "tv", "web"]
+PLAYER_CLIENTS = [
+    "web_embedded", "tv_embedded", "android_music", "ios_music",
+    "android", "ios", "mweb", "web_safari", "tv", "web",
+]
 DOWNLOAD_FORMATS = ("bestaudio[ext=m4a]/bestaudio/best", "best")
+
+
+def _proxy_opts() -> dict:
+    proxy = os.environ.get("YTDLP_PROXY", "").strip()
+    return {"proxy": proxy} if proxy else {}
 
 
 def _client_opts(client: str) -> dict:
@@ -200,6 +208,7 @@ def download_audio(video_url: str, progress_hooks: list | None = None,
                 **YDL_OPTS_BASE,
                 **_cookie_opts(),
                 **_js_runtime_opts(),
+                **_proxy_opts(),
                 **_client_opts(client),
                 "format": fmt,
                 "outtmpl": os.path.join(DOWNLOAD_DIR, "%(id)s.%(ext)s"),
@@ -545,6 +554,7 @@ async def cmd_health(update: Update, context: ContextTypes.DEFAULT_TYPE):
             **YDL_OPTS_BASE,
             **_cookie_opts(),
             **_js_runtime_opts(),
+            **_proxy_opts(),
             **_client_opts(client),
             "socket_timeout": 10,
         }
