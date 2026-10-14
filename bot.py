@@ -201,9 +201,10 @@ HELP_TEXT = (
     "• 💾 Ukuran file\n"
     "• 🔗 Link YouTube\n"
     "• 🎧 File MP3-nya\n"
-    "• 🖼️ Thumb semua hasil buat pilih\n\n"
+    "• 🖼️ Thumbnail cover lagu\n\n"
     "2) <b>Hasil pertama bukan yang lu mau?</b>\n"
-    "Klik tombol judul lagu di bawah kartu buat lihat hasil lain.\n\n"
+    "Klik tombol judul lagu di bawah kartu. Chat lama bakal dibersihkan,\n"
+    "lalu muncul thumbnail + audio pilihan baru.\n\n"
     "3) <b>Download langsung</b>\n"
     "<code>/dl judul lagu</code>\n"
     "Atau kirim link YouTube-nya langsung.\n\n"
@@ -247,6 +248,7 @@ async def send_audio_message(
         if msg.audio and msg.audio.file_id:
             context.user_data.setdefault("file_ids", {})[res["id"]] = msg.audio.file_id
             context.user_data.setdefault("sizes", {})[res["id"]] = filesize_mb
+        await send_result_thumbnails(update, results, index)
         await status.delete()
     except Exception as e:
         logging.exception("send audio failed: %s", e)
@@ -257,20 +259,20 @@ async def send_audio_message(
 
 
 async def send_result_thumbnails(update: Update, results: list[dict], current: int = 0) -> None:
-    """Send thumbnail images for all results so user can see covers before picking."""
-    for i, res in enumerate(results):
-        thumb = await asyncio.to_thread(fetch_thumbnail, res)
-        if not thumb:
-            continue
-        label = "▶️ Pilihan" if i == current else f"{i + 1}."
-        try:
-            await update.effective_message.reply_photo(
-                io.BytesIO(thumb),
-                caption=f"{label} {html.escape(truncate(res['title'], 70))} — {html.escape(truncate(res['uploader'], 40))}",
-                parse_mode=ParseMode.HTML,
-            )
-        except Exception:
-            pass
+    """Send thumbnail for the currently selected result only."""
+    res = results[current]
+    thumb = await asyncio.to_thread(fetch_thumbnail, res)
+    if not thumb:
+        return
+    label = "▶️ Pilihan" if current == 0 else f"{current + 1}."
+    try:
+        await update.effective_message.reply_photo(
+            io.BytesIO(thumb),
+            caption=f"{label} {html.escape(truncate(res['title'], 70))} — {html.escape(truncate(res['uploader'], 40))}",
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception:
+        pass
 
 
 async def send_song(update: Update, context: ContextTypes.DEFAULT_TYPE,
@@ -287,6 +289,7 @@ async def send_song(update: Update, context: ContextTypes.DEFAULT_TYPE,
                 parse_mode=ParseMode.HTML,
                 reply_markup=build_results_keyboard(results, index),
             )
+            await send_result_thumbnails(update, results, index)
             await status.edit_text("✅ Terkirim.")
             await asyncio.sleep(2)
             await status.delete()
@@ -426,11 +429,9 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if index >= len(results):
             return
         context.user_data["current"] = index
-        # Update keyboard on the old card so selection is visible
+        # Clear the old card + thumbnail so the chat stays clean
         try:
-            await q.edit_message_reply_markup(
-                reply_markup=build_results_keyboard(results, index)
-            )
+            await q.message.delete()
         except Exception:
             pass
         status = await q.message.reply_text(
