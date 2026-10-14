@@ -1,5 +1,6 @@
 import os
 import re
+import io
 import html
 import shutil
 import asyncio
@@ -167,15 +168,16 @@ def build_song_card(res: dict, filesize_mb: float = 0) -> str:
 
 
 def build_results_keyboard(results: list[dict], current: int = 0) -> InlineKeyboardMarkup:
-    row = [
-        InlineKeyboardButton(f"● {i + 1}", callback_data="noop")
-        if i == current
-        else InlineKeyboardButton(f"{i + 1}", callback_data=f"res:{i}")
-        for i in range(len(results))
-    ]
+    buttons = []
+    for i, res in enumerate(results):
+        if i == current:
+            buttons.append(InlineKeyboardButton(f"✅ {res['title']}", callback_data="noop"))
+        else:
+            buttons.append(InlineKeyboardButton(res["title"], callback_data=f"res:{i}"))
+    row = [buttons[i: i + 2] for i in range(0, len(buttons), 2)]
     return InlineKeyboardMarkup(
         [
-            row,
+            *row,
             [
                 InlineKeyboardButton("🎵 Kirim Audio", callback_data="send_audio"),
                 InlineKeyboardButton("▶️ YouTube", url=results[current]["url"]),
@@ -198,9 +200,10 @@ HELP_TEXT = (
     "• ⏱️ Durasi\n"
     "• 💾 Ukuran file\n"
     "• 🔗 Link YouTube\n"
-    "• 🎧 File MP3-nya\n\n"
+    "• 🎧 File MP3-nya\n"
+    "• 🖼️ Thumb semua hasil buat pilih\n\n"
     "2) <b>Hasil pertama bukan yang lu mau?</b>\n"
-    "Klik tombol angka (2, 3, 4…) di bawah kartu buat lihat hasil lain.\n\n"
+    "Klik tombol judul lagu di bawah kartu buat lihat hasil lain.\n\n"
     "3) <b>Download langsung</b>\n"
     "<code>/dl judul lagu</code>\n"
     "Atau kirim link YouTube-nya langsung.\n\n"
@@ -251,6 +254,23 @@ async def send_audio_message(
     finally:
         if os.path.exists(filepath):
             os.remove(filepath)
+
+
+async def send_result_thumbnails(update: Update, results: list[dict], current: int = 0) -> None:
+    """Send thumbnail images for all results so user can see covers before picking."""
+    for i, res in enumerate(results):
+        thumb = await asyncio.to_thread(fetch_thumbnail, res)
+        if not thumb:
+            continue
+        label = "▶️ Pilihan" if i == current else f"{i + 1}."
+        try:
+            await update.effective_message.reply_photo(
+                io.BytesIO(thumb),
+                caption=f"{label} {html.escape(truncate(res['title'], 70))} — {html.escape(truncate(res['uploader'], 40))}",
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            pass
 
 
 async def send_song(update: Update, context: ContextTypes.DEFAULT_TYPE,
@@ -383,6 +403,7 @@ async def handle_search(update: Update, context: ContextTypes.DEFAULT_TYPE, quer
     context.user_data["results"] = results
     context.user_data["current"] = 0
 
+    await send_result_thumbnails(update, results, 0)
     await send_song(update, context, results, 0, status)
 
 
