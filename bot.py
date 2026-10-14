@@ -45,11 +45,20 @@ YDL_OPTS_BASE = {
     "retries": 0,
 }
 
-# Player clients tried one-by-one (first success wins). Embedded/music
-# clients face lighter bot-checks than the main web client.
-PLAYER_CLIENTS = [
-    "web_embedded", "tv_embedded", "android_music", "ios_music",
-    "android", "ios", "mweb", "web_safari", "tv", "web",
+# (client, use_cookies) tried one-by-one, first success wins.
+# Per yt-dlp maintainers (#17497): logged-in cookies break some clients,
+# so embedded/mobile clients go WITHOUT cookies; mweb needs a PO token
+# (provided by yt-dlp-ejs + deno); web_creator goes WITH login cookies.
+PLAYER_CONFIGS = [
+    ("mweb", False),
+    ("web_creator", True),
+    ("android_music", False),
+    ("android", False),
+    ("web_embedded", False),
+    ("tv_embedded", False),
+    ("ios", False),
+    ("tv", True),
+    ("web", True),
 ]
 DOWNLOAD_FORMATS = ("bestaudio[ext=m4a]/bestaudio/best", "best")
 
@@ -202,11 +211,12 @@ def download_audio(video_url: str, progress_hooks: list | None = None,
     one-by-one, each with audio-first then muxed format. First success wins."""
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
     errs: list[str] = []
-    for client in PLAYER_CLIENTS:
+    cookie = _cookie_opts()
+    for client, use_cookies in PLAYER_CONFIGS:
         for fmt in DOWNLOAD_FORMATS:
             opts = {
                 **YDL_OPTS_BASE,
-                **_cookie_opts(),
+                **(cookie if use_cookies else {}),
                 **_js_runtime_opts(),
                 **_proxy_opts(),
                 **_client_opts(client),
@@ -517,9 +527,14 @@ async def cmd_health(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         lines.append("❌ ffmpeg: gak ketemu")
 
-    # deno
+    # deno + ejs solver (needed for PO-token challenges)
     dn = shutil.which("deno")
     lines.append(f"{'✅' if dn else '❌'} deno: {html.escape(dn or 'gak ketemu')}")
+    try:
+        import yt_dlp_ejs  # noqa: F401
+        lines.append("✅ yt-dlp-ejs: terinstall (PO-token solver)")
+    except Exception:
+        lines.append("❌ yt-dlp-ejs: BELUM terinstall (player bakal sering gagal)")
 
     # yt-dlp
     try:
@@ -547,12 +562,12 @@ async def cmd_health(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
-    # quick player probe per client (stops at first success)
+    # quick player probe per (client, cookies) config (stops at first success)
     probe = await update.message.reply_text("⏳ Tes player YouTube per client…")
-    def _probe_one(client: str):
+    def _probe_one(client: str, use_cookies: bool):
         opts = {
             **YDL_OPTS_BASE,
-            **_cookie_opts(),
+            **(_cookie_opts() if use_cookies else {}),
             **_js_runtime_opts(),
             **_proxy_opts(),
             **_client_opts(client),
@@ -565,15 +580,16 @@ async def cmd_health(update: Update, context: ContextTypes.DEFAULT_TYPE):
             fmts = info.get("formats") or []
             return info.get("title"), len(fmts)
     verdicts = []
-    for client in PLAYER_CLIENTS:
+    for client, use_cookies in PLAYER_CONFIGS:
+        tag = f"{client}{'+ck' if use_cookies else ''}"
         try:
             _t, _n = await asyncio.wait_for(
-                asyncio.to_thread(_probe_one, client), timeout=15
+                asyncio.to_thread(_probe_one, client, use_cookies), timeout=15
             )
-            verdicts.append(f"✅ {client}: {_n} format")
+            verdicts.append(f"✅ {tag}: {_n} format")
             break
         except Exception as e:
-            verdicts.append(f"❌ {client}: {html.escape(short_error(e, 90))}")
+            verdicts.append(f"❌ {tag}: {html.escape(short_error(e, 90))}")
     await probe.edit_text(
         "🔬 <b>Hasil probe per client:</b>\n" + "\n".join(verdicts),
         parse_mode=ParseMode.HTML,

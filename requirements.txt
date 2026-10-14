@@ -1,3 +1,4 @@
 python-telegram-bot>=21.6
 yt-dlp>=2024.12.13
+yt-dlp-ejs
 requests>=2.32.0
