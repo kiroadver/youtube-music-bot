@@ -9,6 +9,7 @@ import logging
 import requests
 import yt_dlp
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import InputMediaPhoto, InputMediaAudio
 from telegram.constants import ChatAction, ParseMode
 from telegram.ext import (
     ApplicationBuilder,
@@ -31,8 +32,8 @@ MAX_FILESIZE = MAX_FILESIZE_MB * 1024 * 1024
 MAX_DURATION = 15 * 60
 MAX_RESULTS = 5
 DOWNLOAD_DIR = "/tmp/ytmusic-bot"
-DOWNLOAD_TIMEOUT = 120  # seconds per download
-SEARCH_TIMEOUT = 20  # seconds per search
+DOWNLOAD_TIMEOUT = 120
+SEARCH_TIMEOUT = 20
 
 YDL_OPTS_BASE = {
     "quiet": True,
@@ -50,7 +51,6 @@ def _cookie_opts() -> dict:
 
 
 def _js_runtime_opts() -> dict:
-    """Add deno JS runtime if available (needed to bypass YouTube PO token challenge)."""
     if shutil.which("deno"):
         return {"js_runtimes": {"deno": {"path": "deno"}}}
     return {}
@@ -135,7 +135,6 @@ def download_audio(video_url: str) -> tuple[str, dict]:
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(video_url, download=True)
         filepath = ydl.prepare_filename(info)
-        # Postprocessor renames output to .mp3
         if not filepath.endswith(".mp3"):
             mp3 = os.path.splitext(filepath)[0] + ".mp3"
             if os.path.exists(mp3):
@@ -175,15 +174,84 @@ def build_results_keyboard(results: list[dict], current: int = 0) -> InlineKeybo
         else:
             buttons.append(InlineKeyboardButton(res["title"], callback_data=f"res:{i}"))
     row = [buttons[i: i + 2] for i in range(0, len(buttons), 2)]
-    return InlineKeyboardMarkup(
+    keyboard = [
+        *row,
         [
-            *row,
-            [
-                InlineKeyboardButton("🎵 Kirim Audio", callback_data="send_audio"),
-                InlineKeyboardButton("▶️ YouTube", url=results[current]["url"]),
-            ],
-        ]
-    )
+            InlineKeyboardButton("🎵 Kirim Audio", callback_data="send_audio"),
+            InlineKeyboardButton("▶️ YouTube", url=results[current]["url"]),
+        ],
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+
+async def clear_previous_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Delete previously sent media group so chat doesn't stack up."""
+    media_ids = context.user_data.get("media_ids", [])
+    for msg_id in media_ids:
+        try:
+            await update.bot.delete_message(update.effective_chat.id, msg_id)
+        except Exception:
+            pass
+    context.user_data["media_ids"] = []
+
+
+async def send_media_group(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    res: dict,
+    results: list[dict],
+    index: int,
+    audio_file,
+    filesize_mb: float,
+    audio_file_id: str | None = None,
+) -> None:
+    """Send thumbnail + audio as a single media group (inline, not stacked)."""
+    media: list = []
+
+    thumb = await asyncio.to_thread(fetch_thumbnail, res)
+    if thumb:
+        media.append(
+            InputMediaPhoto(
+                io.BytesIO(thumb),
+                caption=(
+                    f"🖼️ {html.escape(truncate(res['title'], 70))}"
+                    f" — {html.escape(truncate(res['uploader'], 40))}"
+                ),
+            )
+        )
+
+    if audio_file_id:
+        media.append(
+            InputMediaAudio(
+                audio_file_id,
+                caption=build_song_card(res, filesize_mb),
+            )
+        )
+    else:
+        media.append(
+            InputMediaAudio(
+                audio_file,
+                caption=build_song_card(res, filesize_mb),
+            )
+        )
+
+    last = media[-1]
+    last.reply_markup = build_results_keyboard(results, index)
+    last.parse_mode = ParseMode.HTML
+    for m in media:
+        if m is not last:
+            m.parse_mode = ParseMode.HTML
+
+    msg = await update.effective_message.reply_media_group(media)
+    ids = [m.message_id for m in msg]
+    context.user_data.setdefault("media_ids", []).extend(ids)
+    context.user_data.setdefault("last_group", []).extend(ids)
+
+    # Cache file_id on audio message (last in group)
+    if audio_file_id:
+        context.user_data.setdefault("file_ids", {})[res["id"]] = audio_file_id
+    else:
+        context.user_data.setdefault("sizes", {})[res["id"]] = filesize_mb
 
 
 HELP_TEXT = (
@@ -194,17 +262,12 @@ HELP_TEXT = (
     "1) <b>Cari &amp; kirim lagu</b>\n"
     "<code>/play judul lagu</code>\n"
     "Contoh: <code>/play tulus monokrom</code>\n\n"
-    "Bot bakal kirim kartu berisi:\n"
-    "• 🎵 Judul + cover\n"
-    "• 👤 Artis\n"
-    "• ⏱️ Durasi\n"
-    "• 💾 Ukuran file\n"
-    "• 🔗 Link YouTube\n"
-    "• 🎧 File MP3-nya\n"
-    "• 🖼️ Thumbnail cover lagu\n\n"
+    "Bot bakal kirim:\n"
+    "• 🖼️ Cover + file MP3 dalam satu grup\n"
+    "• Tombol judul lagu buat pilih hasil lain\n\n"
     "2) <b>Hasil pertama bukan yang lu mau?</b>\n"
-    "Klik tombol judul lagu di bawah kartu. Chat lama bakal dibersihkan,\n"
-    "lalu muncul thumbnail + audio pilihan baru.\n\n"
+    "Klik tombol judul lagu di bawah kartu. Grup lama otomatis dibersihkan,\n"
+    "grup baru (cover + audio pilihan baru) langsung tampil.\n\n"
     "3) <b>Download langsung</b>\n"
     "<code>/dl judul lagu</code>\n"
     "Atau kirim link YouTube-nya langsung.\n\n"
@@ -219,103 +282,6 @@ HELP_TEXT = (
     "• Batas file: 50 MB (lagu maksimal ±15 menit)\n"
     "• /help buat lihat panduan ini lagi"
 )
-
-
-async def send_audio_message(
-    update: Update, context: ContextTypes.DEFAULT_TYPE, res: dict,
-    results: list[dict], index: int, filepath: str, status,
-) -> None:
-    """Send audio + card, remember file_id, cleanup, delete status msg."""
-    filesize_mb = get_filesize_mb(filepath) if os.path.exists(filepath) else 0
-    if not os.path.exists(filepath) or filesize_mb > MAX_FILESIZE_MB:
-        await status.edit_text("❌ File kegedean (limit 50 MB) atau gagal didownload.")
-        if os.path.exists(filepath):
-            os.remove(filepath)
-        return
-    try:
-        thumb = await asyncio.to_thread(fetch_thumbnail, res)
-        with open(filepath, "rb") as f:
-            msg = await update.effective_message.reply_audio(
-                f,
-                title=truncate(res["title"], 60),
-                performer=truncate(res["uploader"], 60),
-                duration=int(res["duration"] or 0),
-                thumbnail=thumb,
-                caption=build_song_card(res, filesize_mb),
-                parse_mode=ParseMode.HTML,
-                reply_markup=build_results_keyboard(results, index),
-            )
-        if msg.audio and msg.audio.file_id:
-            context.user_data.setdefault("file_ids", {})[res["id"]] = msg.audio.file_id
-            context.user_data.setdefault("sizes", {})[res["id"]] = filesize_mb
-        await send_result_thumbnails(update, results, index)
-        await status.delete()
-    except Exception as e:
-        logging.exception("send audio failed: %s", e)
-        await status.edit_text("❌ Gagal kirim audio. Coba lagi.")
-    finally:
-        if os.path.exists(filepath):
-            os.remove(filepath)
-
-
-async def send_result_thumbnails(update: Update, results: list[dict], current: int = 0) -> None:
-    """Send thumbnail for the currently selected result only."""
-    res = results[current]
-    thumb = await asyncio.to_thread(fetch_thumbnail, res)
-    if not thumb:
-        return
-    label = "▶️ Pilihan" if current == 0 else f"{current + 1}."
-    try:
-        await update.effective_message.reply_photo(
-            io.BytesIO(thumb),
-            caption=f"{label} {html.escape(truncate(res['title'], 70))} — {html.escape(truncate(res['uploader'], 40))}",
-            parse_mode=ParseMode.HTML,
-        )
-    except Exception:
-        pass
-
-
-async def send_song(update: Update, context: ContextTypes.DEFAULT_TYPE,
-                   results: list[dict], index: int, status) -> None:
-    """Send song card + audio. Reuse cached file_id if available (fast path)."""
-    res = results[index]
-    file_id = context.user_data.get("file_ids", {}).get(res["id"])
-    if file_id:
-        try:
-            size_mb = context.user_data.get("sizes", {}).get(res["id"], 0)
-            await update.effective_message.reply_audio(
-                file_id,
-                caption=build_song_card(res, size_mb),
-                parse_mode=ParseMode.HTML,
-                reply_markup=build_results_keyboard(results, index),
-            )
-            await send_result_thumbnails(update, results, index)
-            await status.edit_text("✅ Terkirim.")
-            await asyncio.sleep(2)
-            await status.delete()
-        except Exception as e:
-            logging.exception("cached send failed, falling back to download: %s", e)
-            await status.edit_text("⏳ Mengunduh ulang…", parse_mode=ParseMode.PLAIN)
-        else:
-            return
-
-    await status.edit_text(
-        f"⏳ Download: <b>{html.escape(truncate(res['title'], 60))}</b>…",
-        parse_mode=ParseMode.HTML,
-    )
-    await update.effective_chat.send_action(ChatAction.UPLOAD_VOICE)
-    try:
-        filepath, _info = await asyncio.wait_for(
-            asyncio.to_thread(download_audio, res["url"]), timeout=DOWNLOAD_TIMEOUT
-        )
-    except asyncio.TimeoutError:
-        await status.edit_text("❌ Timeout download. Coba lagi atau pilih hasil lain.")
-        return
-    except Exception as e:
-        logging.exception("download failed: %s", e)
-        await status.edit_text("❌ Gagal download lagu. Coba judul lain.")
-        return
-    await send_audio_message(update, context, res, results, index, filepath, status)
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -374,7 +340,16 @@ async def handle_direct(update: Update, context: ContextTypes.DEFAULT_TYPE, text
         "url": info.get("webpage_url", url),
         "thumbnail": info.get("thumbnail", ""),
     }
-    await send_audio_message(update, context, res, [res], 0, filepath, status)
+    await clear_previous_media(update, context)
+    filesize_mb = get_filesize_mb(filepath) if os.path.exists(filepath) else 0
+    with open(filepath, "rb") as f:
+        await send_media_group(
+            update, context, res, [res], 0, f, filesize_mb,
+            audio_file_id=context.user_data.get("file_ids", {}).get(res["id"]),
+        )
+    await status.delete()
+    if os.path.exists(filepath):
+        os.remove(filepath)
 
 
 async def handle_search(update: Update, context: ContextTypes.DEFAULT_TYPE, query: str):
@@ -405,9 +380,55 @@ async def handle_search(update: Update, context: ContextTypes.DEFAULT_TYPE, quer
 
     context.user_data["results"] = results
     context.user_data["current"] = 0
+    context.user_data["media_ids"] = []
 
-    await send_result_thumbnails(update, results, 0)
     await send_song(update, context, results, 0, status)
+
+
+async def send_song(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                   results: list[dict], index: int, status) -> None:
+    """Send media group for result at index. Clear old group first."""
+    res = results[index]
+    file_id = context.user_data.get("file_ids", {}).get(res["id"])
+
+    await clear_previous_media(update, context)
+
+    if file_id:
+        try:
+            size_mb = context.user_data.get("sizes", {}).get(res["id"], 0)
+            await send_media_group(
+                update, context, res, results, index, None, size_mb,
+                audio_file_id=file_id,
+            )
+            await status.delete()
+            return
+        except Exception as e:
+            logging.exception("cached send failed, falling back to download: %s", e)
+
+    await status.edit_text(
+        f"⏳ Download: <b>{html.escape(truncate(res['title'], 60))}</b>…",
+        parse_mode=ParseMode.HTML,
+    )
+    await update.effective_chat.send_action(ChatAction.UPLOAD_VOICE)
+    try:
+        filepath, _info = await asyncio.wait_for(
+            asyncio.to_thread(download_audio, res["url"]), timeout=DOWNLOAD_TIMEOUT
+        )
+    except asyncio.TimeoutError:
+        await status.edit_text("❌ Timeout download. Coba lagi atau pilih hasil lain.")
+        return
+    except Exception as e:
+        logging.exception("download failed: %s", e)
+        await status.edit_text("❌ Gagal download lagu. Coba judul lain.")
+        return
+
+    filesize_mb = get_filesize_mb(filepath) if os.path.exists(filepath) else 0
+    with open(filepath, "rb") as f:
+        await send_media_group(update, context, res, results, index, f, filesize_mb)
+    context.user_data.setdefault("sizes", {})[res["id"]] = filesize_mb
+    await status.delete()
+    if os.path.exists(filepath):
+        os.remove(filepath)
 
 
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -429,11 +450,6 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if index >= len(results):
             return
         context.user_data["current"] = index
-        # Clear the old card + thumbnail so the chat stays clean
-        try:
-            await q.message.delete()
-        except Exception:
-            pass
         status = await q.message.reply_text(
             f"⏳ Sedang siapkan: <b>{html.escape(truncate(results[index]['title'], 60))}</b>…",
             parse_mode=ParseMode.HTML,
@@ -445,25 +461,17 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         index = context.user_data.get("current", 0)
         res = results[index]
         file_id = context.user_data.get("file_ids", {}).get(res["id"])
-        if file_id:
-            await q.answer()
-            status = await q.message.reply_text("⏳ Mengirim ulang audio…")
-            try:
-                size_mb = context.user_data.get("sizes", {}).get(res["id"], 0)
-                await update.effective_message.reply_audio(
-                    file_id,
-                    caption=build_song_card(res, size_mb),
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=build_results_keyboard(results, index),
-                )
-                await status.delete()
-            except Exception as e:
-                logging.exception("resend failed: %s", e)
-                await status.edit_text("❌ Gagal kirim ulang audio.")
-            return
         await q.answer()
         status = await q.message.reply_text("⏳ Mengirim ulang audio…")
-        await send_song(update, context, results, index, status)
+        if file_id:
+            size_mb = context.user_data.get("sizes", {}).get(res["id"], 0)
+            await send_media_group(
+                update, context, res, results, index, None, size_mb,
+                audio_file_id=file_id,
+            )
+            await status.delete()
+        else:
+            await send_song(update, context, results, index, status)
 
 
 def main():
