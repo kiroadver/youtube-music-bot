@@ -152,6 +152,51 @@ def get_filesize_mb(path: str) -> float:
     return os.path.getsize(path) / (1024 * 1024)
 
 
+def prepare_thumb(raw: bytes | None) -> bytes | None:
+    """Resize cover to Telegram spec (JPEG, <=320px, <200KB) via ffmpeg.
+
+    Raw YouTube thumbs (1280px) get silently rejected by Telegram,
+    which is why covers sometimes never show up.
+    """
+    if not raw:
+        return None
+    if not shutil.which("ffmpeg"):
+        return raw if len(raw) < 200 * 1024 else None
+    try:
+        import subprocess
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as src:
+            src.write(raw)
+            src_path = src.name
+        dst_path = src_path + ".small.jpg"
+        r = subprocess.run(
+            ["ffmpeg", "-y", "-loglevel", "error", "-i", src_path,
+             "-vf", "scale=320:-1", "-q:v", "5", dst_path],
+            capture_output=True, timeout=20,
+        )
+        try:
+            os.remove(src_path)
+        except Exception:
+            pass
+        if r.returncode != 0 or not os.path.exists(dst_path):
+            return raw if len(raw) < 200 * 1024 else None
+        if os.path.getsize(dst_path) >= 200 * 1024:
+            try:
+                os.remove(dst_path)
+            except Exception:
+                pass
+            return None
+        with open(dst_path, "rb") as f:
+            out = f.read()
+        try:
+            os.remove(dst_path)
+        except Exception:
+            pass
+        return out
+    except Exception:
+        return raw if len(raw) < 200 * 1024 else None
+
+
 def fetch_thumbnail(res: dict) -> bytes | None:
     """Fetch best available thumbnail, return bytes or None."""
     for q in ("maxresdefault", "hqdefault"):
@@ -248,17 +293,34 @@ def download_audio(video_url: str, progress_hooks: list | None = None,
     raise RuntimeError("semua client gagal: " + " | ".join(errs))
 
 
-def convert_to_mp3(src: str, timeout_s: int = 90) -> str:
-    """Convert audio to MP3 via ffmpeg with a hard timeout (never hangs forever)."""
+def convert_to_mp3(src: str, timeout_s: int = 90, cover_path: str | None = None) -> str:
+    """Convert audio to MP3 via ffmpeg with a hard timeout (never hangs forever).
+
+    If cover_path is given, the cover is embedded into the MP3 (ID3 APIC)
+    so music players show the album art.
+    """
     import subprocess
-    if src.lower().endswith(".mp3"):
+    if src.lower().endswith(".mp3") and not cover_path:
         return src
     dst = os.path.splitext(src)[0] + ".mp3"
-    cmd = [
-        "timeout", str(timeout_s),
-        "ffmpeg", "-y", "-loglevel", "error",
-        "-i", src, "-vn", "-c:a", "libmp3lame", "-b:a", "192k", dst,
-    ]
+    if cover_path and os.path.exists(cover_path):
+        cmd = [
+            "timeout", str(timeout_s),
+            "ffmpeg", "-y", "-loglevel", "error",
+            "-i", src, "-i", cover_path,
+            "-map", "0:a", "-map", "1:v",
+            "-c:a", "libmp3lame", "-b:a", "192k",
+            "-c:v", "mjpeg", "-id3v2_version", "3",
+            "-metadata:s:v", 'title=Album cover',
+            "-metadata:s:v", "comment=Cover (front)",
+            dst,
+        ]
+    else:
+        cmd = [
+            "timeout", str(timeout_s),
+            "ffmpeg", "-y", "-loglevel", "error",
+            "-i", src, "-vn", "-c:a", "libmp3lame", "-b:a", "192k", dst,
+        ]
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s + 10)
     except subprocess.TimeoutExpired:
@@ -273,7 +335,8 @@ def convert_to_mp3(src: str, timeout_s: int = 90) -> str:
     return dst
 
 
-async def download_with_progress(url: str, status, title: str) -> tuple[str, dict]:
+async def download_with_progress(url: str, status, title: str,
+                                 cover_path: str | None = None) -> tuple[str, dict]:
     """Download in background thread while editing status with live % progress."""
     state = {"pct": 0, "phase": "download"}
 
@@ -347,7 +410,9 @@ async def download_with_progress(url: str, status, title: str) -> tuple[str, dic
     # Phase 2: convert with hard timeout (max 100s), timer keeps ticking
     state["phase"] = "convert"
     state["convert_start"] = time.monotonic()
-    conv_task = loop.run_in_executor(None, lambda: convert_to_mp3(filepath, timeout_s=90))
+    conv_task = loop.run_in_executor(
+        None, lambda: convert_to_mp3(filepath, timeout_s=90, cover_path=cover_path)
+    )
     while not conv_task.done():
         if loop.time() - start > DOWNLOAD_TIMEOUT:
             raise asyncio.TimeoutError("convert")
@@ -425,15 +490,19 @@ async def send_media_group(
     audio_file,
     filesize_mb: float,
     audio_file_id: str | None = None,
+    thumb_bytes: bytes | None = None,
 ) -> None:
-    """Send ONE message: audio with cover art attached as thumbnail,
+    """Send ONE message: audio with spec-compliant cover thumbnail,
     full info card as caption, and the result keyboard below."""
-    thumb = await asyncio.to_thread(fetch_thumbnail, res)
+    if thumb_bytes is None:
+        raw = await asyncio.to_thread(fetch_thumbnail, res)
+        thumb_bytes = await asyncio.to_thread(prepare_thumb, raw)
 
     async def _send():
         if audio_file_id:
             audio_msg = await update.effective_message.reply_audio(
                 audio_file_id,
+                thumbnail=thumb_bytes,
                 caption=build_song_card(res, filesize_mb),
                 parse_mode=ParseMode.HTML,
                 reply_markup=build_results_keyboard(results, index),
@@ -444,7 +513,7 @@ async def send_media_group(
                 title=truncate(res["title"], 60),
                 performer=truncate(res["uploader"], 60),
                 duration=int(res["duration"] or 0),
-                thumbnail=thumb,
+                thumbnail=thumb_bytes,
                 caption=build_song_card(res, filesize_mb),
                 parse_mode=ParseMode.HTML,
                 reply_markup=build_results_keyboard(results, index),
@@ -729,9 +798,23 @@ async def send_song(update: Update, context: ContextTypes.DEFAULT_TYPE,
         parse_mode=ParseMode.HTML,
     )
     await update.effective_chat.send_action(ChatAction.UPLOAD_VOICE)
+
+    # Fetch cover early so it can be embedded into the MP3 + sent as thumbnail.
+    raw_thumb = await asyncio.to_thread(fetch_thumbnail, res)
+    thumb_bytes = await asyncio.to_thread(prepare_thumb, raw_thumb)
+    cover_path = None
+    if raw_thumb:
+        try:
+            os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+            cover_path = os.path.join(DOWNLOAD_DIR, f"{res['id']}_cover.jpg")
+            with open(cover_path, "wb") as cf:
+                cf.write(raw_thumb)
+        except Exception:
+            cover_path = None
+
     try:
         filepath, _info = await download_with_progress(
-            res["url"], status, res["title"]
+            res["url"], status, res["title"], cover_path=cover_path
         )
     except asyncio.TimeoutError:
         await status.edit_text("❌ Timeout download. Coba lagi atau pilih hasil lain.")
@@ -751,11 +834,20 @@ async def send_song(update: Update, context: ContextTypes.DEFAULT_TYPE,
                 parse_mode=ParseMode.HTML,
             )
         return
+    finally:
+        if cover_path and os.path.exists(cover_path):
+            try:
+                os.remove(cover_path)
+            except Exception:
+                pass
 
     filesize_mb = get_filesize_mb(filepath) if os.path.exists(filepath) else 0
     try:
         with open(filepath, "rb") as f:
-            await send_media_group(update, context, res, results, index, f, filesize_mb)
+            await send_media_group(
+                update, context, res, results, index, f, filesize_mb,
+                thumb_bytes=thumb_bytes,
+            )
     except asyncio.TimeoutError:
         detail = await report_error(update, context, "upload", asyncio.TimeoutError("upload > 180s"))
         await status.edit_text(
