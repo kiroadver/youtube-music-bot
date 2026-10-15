@@ -1,11 +1,13 @@
 import os
 import re
 import io
+import json
 import html
 import time
 import shutil
 import asyncio
 import logging
+from urllib.parse import quote
 
 import requests
 import yt_dlp
@@ -209,6 +211,133 @@ def fetch_thumbnail(res: dict) -> bytes | None:
                 return r.content
         except Exception:
             continue
+    return None
+
+
+# ----------------------------- Pinterest -----------------------------
+
+PINTEREST_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+)
+PINTEREST_TIMEOUT = 20
+_IMAGE_RE = re.compile(r"\.(?:jpe?g|png)$", re.I)
+_pin_session: requests.Session | None = None
+_pin_state = {"app_version": "7327000", "csrf": ""}
+
+
+def _pinterest_bootstrap(s: requests.Session) -> None:
+    """Grab csrftoken cookie + build appVersion from the homepage."""
+    try:
+        r = s.get("https://www.pinterest.com/", timeout=PINTEREST_TIMEOUT)
+        m = re.search(r'"appVersion":"([^"]+)"', r.text)
+        if m:
+            _pin_state["app_version"] = m.group(1)
+        csrf = s.cookies.get("csrftoken")
+        if csrf:
+            _pin_state["csrf"] = csrf
+    except Exception as e:
+        logging.warning("pinterest bootstrap failed: %s", e)
+
+
+def _pinterest_session() -> requests.Session:
+    global _pin_session
+    if _pin_session is None:
+        s = requests.Session()
+        s.headers.update(
+            {"User-Agent": PINTEREST_UA, "Accept-Language": "en-US,en;q=0.9"}
+        )
+        _pinterest_bootstrap(s)
+        _pin_session = s
+    return _pin_session
+
+
+def _pick_pin_image(pin: dict) -> str:
+    images = pin.get("images") or {}
+    for key in ("orig", "originals", "1200x", "736x", "564x", "474x"):
+        entry = images.get(key)
+        if isinstance(entry, dict) and entry.get("url"):
+            return entry["url"]
+    return ""
+
+
+def _pin_request(s: requests.Session, query: str, bookmark) -> dict:
+    options = {
+        "query": query,
+        "scope": "pins",
+        "bookmarks": [bookmark] if bookmark else [],
+        "no_fetch_context_on_resource": False,
+    }
+    params = {
+        "source_url": f"/search/pins/?q={quote(query)}&rs=typed",
+        "data": json.dumps({"options": options, "context": {}}),
+    }
+    headers = {
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "X-Requested-With": "XMLHttpRequest",
+        "X-Pinterest-AppState": "active",
+        # The single load-bearing header — without it Pinterest 403s.
+        "X-Pinterest-PWS-Handler": "www/search/[scope].js",
+        "X-APP-VERSION": _pin_state["app_version"],
+        "X-CSRFToken": _pin_state["csrf"],
+        "Referer": f"https://www.pinterest.com/search/pins/?q={quote(query)}",
+    }
+    url = "https://www.pinterest.com/resource/BaseSearchResource/get/"
+    r = s.get(url, params=params, headers=headers, timeout=PINTEREST_TIMEOUT)
+    if r.status_code == 403:
+        _pinterest_bootstrap(s)
+        headers["X-APP-VERSION"] = _pin_state["app_version"]
+        headers["X-CSRFToken"] = _pin_state["csrf"]
+        r = s.get(url, params=params, headers=headers, timeout=PINTEREST_TIMEOUT)
+    r.raise_for_status()
+    return r.json().get("resource_response") or {}
+
+
+def pinterest_search(query: str, limit: int = MAX_RESULTS) -> list[str]:
+    """Search Pinterest, return up to `limit` image URLs (no API key).
+
+    Videos and non-JPEG/PNG (e.g. webp) are skipped so Telegram can render
+    them as photos.
+    """
+    query = query.strip()
+    if not query:
+        return []
+    s = _pinterest_session()
+    found: list[str] = []
+    seen: set[str] = set()
+    bookmark = None
+    for _ in range(5):
+        if len(found) >= limit:
+            break
+        body = _pin_request(s, query, bookmark)
+        results = (body.get("data") or {}).get("results") or []
+        for pin in results:
+            if len(found) >= limit:
+                break
+            if pin.get("videos"):
+                continue
+            url = _pick_pin_image(pin)
+            if not url or not _IMAGE_RE.search(url):
+                continue
+            key = url.rsplit("/", 1)[-1]
+            if key in seen:
+                continue
+            seen.add(key)
+            found.append(url)
+        bookmark = body.get("bookmark")
+        if not bookmark:
+            break
+    return found
+
+
+def fetch_image(url: str) -> bytes | None:
+    """Download an image, returning bytes or None."""
+    try:
+        r = _pinterest_session().get(url, timeout=PINTEREST_TIMEOUT)
+        if r.status_code == 200 and len(r.content) > 500:
+            return r.content
+    except Exception as e:
+        logging.warning("fetch_image failed: %s", e)
     return None
 
 
@@ -550,7 +679,11 @@ HELP_TEXT = (
     "3) <b>Download langsung</b>\n"
     "<code>/dl judul lagu</code>\n"
     "Atau kirim link YouTube-nya langsung.\n\n"
-    "4) <b>Tombol cepat</b>\n"
+    "4) <b>Cari foto Pinterest</b> 🖼️\n"
+    "<code>/pin kata kunci</code>\n"
+    "Contoh: <code>/pin sanrio wallpaper</code>\n"
+    "Bot kirim maksimal 5 foto Pinterest, satu per satu.\n\n"
+    "5) <b>Tombol cepat</b>\n"
     "• 🎵 Kirim Audio → kirim ulang file MP3-nya\n"
     "• ▶️ Buka di YouTube → buka link lagunya\n\n"
     "━━━━━━━━━━━━━━━\n"
@@ -675,6 +808,70 @@ async def cmd_dl(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await handle_direct(update, context, arg)
     else:
         await handle_search(update, context, arg)
+
+
+async def cmd_pinterest(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = " ".join(context.args or []).strip()
+    if not query:
+        await update.message.reply_text(
+            "Pake: <code>/pin kata kunci</code>\n"
+            "Contoh: <code>/pin sanrio wallpaper</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    await handle_pinterest(update, context, query)
+
+
+async def handle_pinterest(update: Update, context: ContextTypes.DEFAULT_TYPE, query: str):
+    """Search Pinterest and send up to MAX_RESULTS photos, one per message."""
+    status = await update.message.reply_text(
+        f"🔍 Cari foto Pinterest: <b>{html.escape(query)}</b>…",
+        parse_mode=ParseMode.HTML,
+    )
+    try:
+        urls = await asyncio.wait_for(
+            asyncio.to_thread(pinterest_search, query), timeout=SEARCH_TIMEOUT + 15
+        )
+    except asyncio.TimeoutError:
+        await status.edit_text("❌ Timeout search Pinterest. Coba lagi.")
+        return
+    except Exception as e:
+        detail = await report_error(update, context, "pinterest-search", e)
+        await status.edit_text(
+            f"❌ Gagal cari di Pinterest. Coba lagi nanti.\n\n<i>Detail: {html.escape(detail)}</i>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    if not urls:
+        await status.edit_text("❌ Gak ketemu foto. Coba kata kunci lain.")
+        return
+
+    await status.edit_text(
+        f"🖼️ {len(urls)} foto ditemukan. Mengirim…", parse_mode=ParseMode.HTML
+    )
+    sent = 0
+    for i, url in enumerate(urls, 1):
+        data = await asyncio.to_thread(fetch_image, url)
+        if not data:
+            continue
+        try:
+            await update.effective_chat.send_action(ChatAction.UPLOAD_PHOTO)
+            await update.message.reply_photo(
+                data,
+                caption=f'🖼️ Pinterest: "{truncate(query, 60)}" ({i}/{len(urls)})',
+            )
+            sent += 1
+        except Exception as e:
+            logging.warning("send pinterest photo failed: %s", e)
+
+    if sent == 0:
+        await status.edit_text("❌ Gagal mengirim foto Pinterest. Coba lagi.")
+        return
+    try:
+        await status.delete()
+    except Exception:
+        pass
 
 
 YT_RE = re.compile(
@@ -934,6 +1131,7 @@ def main():
     app.add_handler(CommandHandler("health", cmd_health))
     app.add_handler(CommandHandler("play", cmd_play))
     app.add_handler(CommandHandler("dl", cmd_dl))
+    app.add_handler(CommandHandler(["pin", "pinterest"], cmd_pinterest))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
     app.add_handler(CallbackQueryHandler(on_button))
 

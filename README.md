@@ -2,6 +2,8 @@
 
 Cari lagu di YouTube, langsung dapet info + file MP3-nya, langsung dikirim ke Telegram.
 
+Bonus: cari foto di Pinterest juga bisa. 🖼️
+
 ## ✨ Fitur
 
 - **Pencarian** — ketik judul lagu, bot cari di YouTube, auto-skip hasil mix/playlist/kumpulan & lagu >15 menit
@@ -9,6 +11,7 @@ Cari lagu di YouTube, langsung dapet info + file MP3-nya, langsung dikirim ke Te
 - **Pilih hasil** — tombol angka (1–5) buat ganti hasil kalau yang pertama bukan yang lu mau
 - **Kirim ulang** — tombol 🎵 Kirim Audio buat resend file tanpa download ulang
 - **Download langsung** — `/dl` atau tempel link YouTube apa adanya
+- **Cari foto Pinterest** — `/pin` cari foto di Pinterest (maks 5, tanpa API key)
 - **Batas aman** — file maksimal 50 MB (sesuai limit Telegram)
 
 ## 📖 Cara Pakai
@@ -55,11 +58,28 @@ https://youtu.be/XXXXXXX
 - 🎵 **Kirim Audio** → kirim ulang file MP3-nya
 - ▶️ **Buka di YouTube** → buka link lagunya
 
+### 5) Cari foto Pinterest 🖼️
+
+```
+/pin kata kunci
+```
+
+Contoh:
+
+```
+/pin sanrio wallpaper
+```
+
+Bot kirim maksimal 5 foto Pinterest, satu per satu (caption `(i/n)`).
+Gak butuh API key — bot ambil langsung dari hasil pencarian Pinterest.
+Foto yang bukan format JPG/PNG (mis. webp) atau video otomatis dilewati.
+
 ## 💡 Tips
 
 - Ketik judul lagu langsung juga bisa (tanpa `/play`)
 - Sertakan nama artis biar hasilnya lebih akurat
 - Hasil kelamaan / numpuk (mix, playlist, kumpulan) otomatis dilewati
+- Foto Pinterest pakai perintah `/pin` (atau `/pinterest`) — teks biasa tetap dianggap pencarian lagu
 - Batas file: 50 MB (lagu maksimal ±15 menit)
 - `/help` buat lihat panduan ini lagi
 
@@ -169,6 +189,7 @@ sudo systemctl status yt-music-bot
 | `Sign in to confirm you're not a bot` | IP server kamu diblokir YouTube. Export cookies dari browser (pake extention "Get cookies.txt") simpan jadi `cookies.txt`, lalu set `YTDLP_COOKIES=/path/cookies.txt` di env var. Pake IP residential / VPS non-datacenter juga bisa |
 | Download gagal / stuck | YouTube update anti-scraping. Upgrade: `pip install -U yt-dlp` |
 | File > 50 MB ditolak | Sudah di-limit, cari versi lagu lebih pendek atau pake link lain |
+| `/pin` gak ada hasil / error | Pinterest kadang nolak request dari IP datacenter. Coba lagi, atau pindah ke IP residential/VPS biasa |
 | Bot lambat | Tambahin caching / pake VPS dengan koneksi bagus |
 
 ### 🍪 Setup Cookies (kalau download kena blokir bot)
