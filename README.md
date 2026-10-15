@@ -72,7 +72,9 @@ Contoh:
 
 Bot kirim maksimal 5 foto Pinterest, satu per satu (caption `(i/n)`).
 Gak butuh API key — bot ambil langsung dari hasil pencarian Pinterest.
-Foto yang bukan format JPG/PNG (mis. webp) atau video otomatis dilewati.
+Hasil **diacak** (dari beberapa halaman), jadi query yang sama bisa kasih foto
+beda tiap kali. Foto yang bukan format JPG/PNG (mis. webp) atau video otomatis
+dilewati.
 
 ## 💡 Tips
 

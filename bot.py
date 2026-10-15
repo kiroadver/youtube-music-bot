@@ -4,6 +4,7 @@ import io
 import json
 import html
 import time
+import random
 import shutil
 import asyncio
 import logging
@@ -221,6 +222,10 @@ PINTEREST_UA = (
     "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 )
 PINTEREST_TIMEOUT = 20
+# How many Pinterest pages to pool before randomly sampling `limit` images.
+# More pages = more variety per query, at the cost of a little latency.
+PINTEREST_PAGES = 3
+PINTEREST_POOL = 40
 _IMAGE_RE = re.compile(r"\.(?:jpe?g|png)$", re.I)
 _pin_session: requests.Session | None = None
 _pin_state = {"app_version": "7327000", "csrf": ""}
@@ -296,24 +301,23 @@ def _pin_request(s: requests.Session, query: str, bookmark) -> dict:
 def pinterest_search(query: str, limit: int = MAX_RESULTS) -> list[str]:
     """Search Pinterest, return up to `limit` image URLs (no API key).
 
-    Videos and non-JPEG/PNG (e.g. webp) are skipped so Telegram can render
-    them as photos.
+    Gathers a larger pool across pages, then returns a random sample so the
+    same query gives fresh photos on each call. Videos and non-JPEG/PNG
+    (e.g. webp) are skipped so Telegram can render them as photos.
     """
     query = query.strip()
     if not query:
         return []
     s = _pinterest_session()
-    found: list[str] = []
+    pool: list[str] = []
     seen: set[str] = set()
     bookmark = None
-    for _ in range(5):
-        if len(found) >= limit:
+    for _ in range(PINTEREST_PAGES):
+        if len(pool) >= PINTEREST_POOL:
             break
         body = _pin_request(s, query, bookmark)
         results = (body.get("data") or {}).get("results") or []
         for pin in results:
-            if len(found) >= limit:
-                break
             if pin.get("videos"):
                 continue
             url = _pick_pin_image(pin)
@@ -323,11 +327,12 @@ def pinterest_search(query: str, limit: int = MAX_RESULTS) -> list[str]:
             if key in seen:
                 continue
             seen.add(key)
-            found.append(url)
+            pool.append(url)
         bookmark = body.get("bookmark")
         if not bookmark:
             break
-    return found
+    random.shuffle(pool)
+    return pool[:limit]
 
 
 def fetch_image(url: str) -> bytes | None:
